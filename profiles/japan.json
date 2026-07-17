@@ -4,7 +4,7 @@
   "language": "日语",
   "version": "v0.1",
   "updated": "2026-07-17",
-  "note": "冷启动版本，尚未经母语者校准（盲测校准排期见 docs/实验设计.md）",
+  "note": "冷启动版本，尚未经母语者校准（盲测校准排期见 docs/experiment-design.md）",
   "entries": [
     {
       "id": "jp-001",
