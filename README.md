@@ -41,7 +41,7 @@
 ## 快速开始
 
 ```bash
-pip install openai
+pip install -r requirements.txt
 cp .env.example .env   # 填入你的 LLM API Key（默认 DeepSeek，兼容 OpenAI 接口）
 
 python pipeline.py     # 单条演示：中文创意 → 泰国版
