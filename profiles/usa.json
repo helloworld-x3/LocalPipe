@@ -1,0 +1,66 @@
+{
+  "market": "美国",
+  "market_code": "us",
+  "language": "英语",
+  "version": "v0.1",
+  "updated": "2026-07-17",
+  "note": "冷启动版本，尚未经母语者校准（盲测校准排期见 docs/实验设计.md）",
+  "entries": [
+    {
+      "id": "us-001",
+      "type": "文化禁忌",
+      "content": "涉及种族、性别、体型的刻板印象表述是高压线，「学生党」「早八人」等中式人群标签直译易产生刻板印象风险，需转为兴趣/场景标签（gamer, morning person）",
+      "confidence": "高",
+      "expires": null,
+      "source": "LLM冷启动+公开资料交叉验证"
+    },
+    {
+      "id": "us-002",
+      "type": "文化禁忌",
+      "content": "功效类断言受FTC约束，「3秒降温15度」类数字卖点保留时需可验证，健康/功效暗示（补充蛋白质、防中暑）不可扩大为医疗效果表述",
+      "confidence": "高",
+      "expires": null,
+      "source": "LLM冷启动+公开资料交叉验证"
+    },
+    {
+      "id": "us-003",
+      "type": "语言风格",
+      "content": "偏好直接、口语化、带幽默感的表达，自嘲和夸张修辞（hyperbole）接受度高；中文广告常见的排比抒情体（「每一颗都来自……」）会显得做作，需转为事实+态度的短句",
+      "confidence": "中",
+      "expires": "2026-12-31",
+      "source": "LLM冷启动"
+    },
+    {
+      "id": "us-004",
+      "type": "流行元素",
+      "content": "meme文化是社媒传播主要载体，梗更替极快（周级）；「POV:」「no cap」「it's giving...」等网络用语适用于Z世代向文案，但用错代际反而尴尬，置信度随时间快速衰减",
+      "confidence": "低",
+      "expires": "2026-09-17",
+      "source": "LLM冷启动"
+    },
+    {
+      "id": "us-005",
+      "type": "审美偏好",
+      "content": "偏好真实感（authenticity）：UGC质感、真人实拍优于精修棚拍；过度修饰的完美画面信任度低；文案里的「too good to be true」感会触发怀疑",
+      "confidence": "高",
+      "expires": "2027-01-01",
+      "source": "LLM冷启动+行业案例"
+    },
+    {
+      "id": "us-006",
+      "type": "消费习惯",
+      "content": "评论星级与退货政策是下单前置检查项，free returns / money-back guarantee 是有效信任钩子；「一杯奶茶钱」类价格锚点需换算为本地等价物（a cup of coffee）",
+      "confidence": "中",
+      "expires": "2026-12-31",
+      "source": "LLM冷启动"
+    },
+    {
+      "id": "us-007",
+      "type": "平台特点",
+      "content": "TikTok Shop带货增长快但信任仍在建立期；Instagram Reels覆盖面广；Reddit评价对3C数码品类购买决策影响大，社区语境反感硬广",
+      "confidence": "高",
+      "expires": "2026-12-31",
+      "source": "LLM冷启动+公开报告"
+    }
+  ]
+}
