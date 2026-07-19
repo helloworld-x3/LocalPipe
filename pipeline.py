@@ -33,7 +33,7 @@ load_dotenv()
 
 from model import ModelClient, ModelConfig
 
-FIDELITY_THRESHOLD = 0.7  # 要素回收率低于此值自动重生成
+FIDELITY_THRESHOLD = 0.7  # 要素回收率低于此值自动重生成。初始经验值，W1 实验中对比不同阈值下的母语者评分以确定最优值（计划测试 0.6/0.7/0.8 三档）
 MAX_RETRIES = 2
 
 
