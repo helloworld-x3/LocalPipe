@@ -31,7 +31,7 @@ def load_dotenv():
 
 load_dotenv()
 
-from model import ModelClient, ModelConfig
+from model import ModelClient, ModelConfig, sanitize_user_input
 
 FIDELITY_THRESHOLD = 0.7  # 要素回收率低于此值自动重生成。初始经验值，W1 实验中对比不同阈值下的母语者评分以确定最优值（计划测试 0.6/0.7/0.8 三档）
 MAX_RETRIES = 2
@@ -135,10 +135,11 @@ def profile_context(profile):
 # ========== 第一层：创意解构 ==========
 
 def deconstruct(source_text):
+    safe_text = sanitize_user_input(source_text)
     prompt = f"""你是广告创意分析师。拆解以下中文营销文案的创意要素。
 
 【源文案】
-{source_text}
+{safe_text}
 
 输出 JSON：
 {{
@@ -224,7 +225,7 @@ def fidelity_check(localized_copy, original_elements, brand=None):
     prompt = f"""你是质检员。以下是一条本地化后的营销文案，和它源创意的要素表。逐项检查源要素是否在本地化文案中得到保留（允许文化形式变化，但营销功能必须还在）。
 {term_section}
 【本地化文案】
-{localized_copy}
+{sanitize_user_input(localized_copy)}
 
 【源创意要素】
 {json.dumps(original_elements, ensure_ascii=False)}
@@ -250,7 +251,7 @@ def taboo_check(localized_copy, profile):
     prompt = f"""你是{market}市场合规审查员。检查以下文案是否触碰禁忌清单，以及是否有清单外的文化/宗教/广告法风险。
 
 【文案】
-{localized_copy}
+{sanitize_user_input(localized_copy)}
 
 【禁忌清单】
 {taboo_text}

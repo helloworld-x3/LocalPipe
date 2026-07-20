@@ -2,11 +2,36 @@
 
 from openai import OpenAI
 import os
+import re
 import sys
 import json
 import time
 
 MAX_RETRIES = 2
+
+# Prompt 注入防御：高风险指令模式
+_INJECTION_PATTERNS = [
+    r"(?:忽略|无视|忘记|不要).{0,10}(?:以上|之前|前面|所有|系统).{0,10}(?:指令|提示|规则|要求)",
+    r"(?:输出|显示|打印|泄露|告诉我).{0,10}(?:系统.{0,5})?(?:prompt|提示词|指令|规则|设定)",
+    r"(?:你是|你现在是|你变成|扮演).{0,15}(?:而不是|不再是)",
+    r"(?:DAN|Developer Mode|jailbreak)",
+]
+
+
+def sanitize_user_input(text):
+    """清洗用户输入：检测注入特征，用分隔符隔离指令与数据"""
+    if not text or not isinstance(text, str):
+        return text
+
+    # 检测高风险模式
+    for pat in _INJECTION_PATTERNS:
+        if re.search(pat, text, re.IGNORECASE):
+            raise ValueError(f"输入包含疑似指令注入内容，已拦截: {pat}")
+
+    # XML 标签隔离：防止用户文本被 LLM 误解为指令
+    sanitized = text.replace("<user_input>", "").replace("</user_input>", "")
+    sanitized = sanitized.replace("<|im_start|>", "").replace("<|im_end|>", "")
+    return f"<user_input>\n{sanitized}\n</user_input>"
 
 
 class ModelConfig:
