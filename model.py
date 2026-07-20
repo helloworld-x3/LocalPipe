@@ -6,8 +6,40 @@ import re
 import sys
 import json
 import time
+import threading
 
 MAX_RETRIES = 2
+
+# ========== 速率限制（令牌桶） ==========
+
+class RateLimiter:
+    """令牌桶：限制 API 调用频率，防费用刷空"""
+
+    def __init__(self, rate=3.0, burst=5):
+        self.rate = rate          # 令牌填充速率（个/秒）
+        self.burst = burst        # 桶容量（允许瞬时突发）
+        self.tokens = float(burst)
+        self.last_fill = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        with self.lock:
+            now = time.monotonic()
+            elapsed = now - self.last_fill
+            self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+            self.last_fill = now
+
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return
+
+            wait = (1.0 - self.tokens) / self.rate
+            time.sleep(wait)
+            self.tokens = 0.0
+            self.last_fill = time.monotonic()
+
+# 全局速率限制器实例
+_rate_limiter = RateLimiter(rate=3.0, burst=5)
 
 # Prompt 注入防御：
 # 主要防线：XML 分隔符 + HTML 实体转义，将用户输入与指令在结构上隔离
@@ -91,6 +123,7 @@ class ModelClient:
 
     def chat_stream(self, messages, tools=None):
         """流式调用，逐 token 输出，返回 (完整文本, tool_calls)"""
+        _rate_limiter.acquire()
         last_error = None
         for attempt in range(MAX_RETRIES + 1):
             try:
@@ -111,6 +144,7 @@ class ModelClient:
 
     def chat_simple(self, messages, max_tokens=200):
         """非流式调用，返回纯文本。用于内部工具（如语义搜索）"""
+        _rate_limiter.acquire()
         try:
             resp = self.client.chat.completions.create(
                 model=self.config.model,

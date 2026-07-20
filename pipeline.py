@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import hashlib
 from datetime import date
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,47 +38,147 @@ FIDELITY_THRESHOLD = 0.7  # 要素回收率低于此值自动重生成。初始�
 MAX_RETRIES = 2
 
 
-def _llm_json(prompt, max_tokens=900):
+# ========== JSON Schema 校验（响应完整性） ==========
+
+# 各层产出结构定义：(必需键, 类型约束)
+_SCHEMAS = {
+    "deconstruct": {
+        "required": ["selling_points", "emotion_hook", "target_audience", "cta"],
+        "types": {"selling_points": list, "emotion_hook": str, "target_audience": str, "cta": str},
+    },
+    "recreate": {
+        "required": ["copy", "copy_zh", "used_entries", "adaptation_note"],
+        "types": {"copy": str, "copy_zh": str, "used_entries": list, "adaptation_note": str},
+    },
+    "fidelity": {
+        "required": ["checks", "recovery_rate"],
+        "types": {"checks": list, "recovery_rate": (int, float)},
+    },
+    "taboo": {
+        "required": ["risk_level", "flags"],
+        "types": {"risk_level": str, "flags": list},
+    },
+}
+
+
+def validate_schema(data, layer_name):
+    """校验 LLM 响应结构完整性——防响应篡改/模型输出畸变"""
+    schema = _SCHEMAS.get(layer_name)
+    if not schema:
+        return  # 未注册的层跳过
+
+    missing = [k for k in schema["required"] if k not in data]
+    if missing:
+        raise ValueError(f"[{layer_name}] Schema 校验失败：缺少字段 {missing}。响应: {json.dumps(data, ensure_ascii=False)[:200]}")
+
+    for key, expected in schema["types"].items():
+        if key in data and not isinstance(data[key], expected):
+            raise ValueError(f"[{layer_name}] Schema 校验失败：{key} 类型应为 {expected}, 实际 {type(data[key])}")
+
+
+# ========== 画像完整性校验 ==========
+
+def _profile_hash_path():
+    return os.path.join(BASE_DIR, "profiles", ".hashes.json")
+
+
+def _load_hashes():
+    p = _profile_hash_path()
+    if os.path.isfile(p):
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def verify_profile_integrity(path, market_code):
+    """SHA256 验签——防画像文件被篡改"""
+    hashes = _load_hashes()
+    if market_code not in hashes:
+        return  # 无基线哈希，跳过（首次使用需先 gen_profile_hashes）
+
+    with open(path, "rb") as f:
+        actual = hashlib.sha256(f.read()).hexdigest()
+
+    expected = hashes[market_code]
+    if actual != expected:
+        raise RuntimeError(
+            f"画像完整性校验失败: {market_code}.json 的 SHA256 不匹配！"
+            f"预期 {expected[:16]}...，实际 {actual[:16]}..."
+            f"如确信文件未被篡改，请执行 gen_profile_hashes() 更新基线"
+        )
+
+
+def gen_profile_hashes():
+    """生成/更新所有画像文件的 SHA256 基线（在已知安全环境下执行）"""
+    profile_dir = os.path.join(BASE_DIR, "profiles")
+    hashes = {}
+    for fn in sorted(os.listdir(profile_dir)):
+        if fn.endswith(".json") and not fn.startswith("."):
+            with open(os.path.join(profile_dir, fn), "rb") as f:
+                h = hashlib.sha256(f.read()).hexdigest()
+            # 从文件内容提取 market_code
+            with open(os.path.join(profile_dir, fn), encoding="utf-8") as f:
+                code = json.load(f).get("market_code", fn.replace(".json", ""))
+            hashes[code] = h
+            print(f"  {code}: {h[:16]}...")
+
+    with open(_profile_hash_path(), "w", encoding="utf-8") as f:
+        json.dump(hashes, f, indent=2)
+    print(f"哈希基线已保存: {_profile_hash_path()}")
+    return hashes
+
+
+def _llm_json(prompt, max_tokens=900, schema=None):
     config = ModelConfig()
     model = ModelClient(config)
     text = model.chat_simple([{"role": "user", "content": prompt}], max_tokens=max_tokens)
 
-    # 先试 json.loads（需反序列化）
+    def _parse_and_validate(raw):
+        data = json.loads(raw)
+        if schema:
+            validate_schema(data, schema)
+        return data
+
+    # 先试 json.loads
     m = re.search(r'\{[\s\S]*\}', text)
     if not m:
         m2 = re.search(r'\[[\s\S]*\]', text)
         if not m2:
             raise ValueError(f"LLM未返回JSON结构: {text[:300]}")
-        return json.loads(m2.group())
+        result = json.loads(m2.group())
+        if schema:
+            validate_schema(result, schema)
+        return result
 
     raw = m.group()
 
     # 尝试 1: 直接解析
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
+        return _parse_and_validate(raw)
+    except (json.JSONDecodeError, ValueError):
         pass
 
-    # 尝试 2: 用 json.loads 解析包含转义序列的字符串
-    # LLM 有时吐出 literal "\n" 而不是真正的换行
+    # 尝试 2: literal "\n" → 真正的换行
     try:
         cleaned = raw.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
+        return _parse_and_validate(cleaned)
+    except (json.JSONDecodeError, ValueError):
         pass
 
-    # 尝试 3: 用 ast.literal_eval 处理含 Python 风格的转义
+    # 尝试 3: ast.literal_eval 处理 Python 风格转义
     try:
         import ast
         cleaned = raw
         if re.search(r'\\u[0-9a-fA-F]{4}', cleaned):
-            # 可能有双重转义的 unicode: \\u0e01 → ก
             cleaned = re.sub(r'\\\\u([0-9a-fA-F]{4})', r'\\u\1', cleaned)
-        return ast.literal_eval(cleaned)
+        data = ast.literal_eval(cleaned)
+        if schema:
+            validate_schema(data, schema)
+        return data
     except Exception:
         pass
 
-    # 尝试 4: 重新让 LLM 修复（兜底）
+    # 尝试 4: 让 LLM 修复（兜底）
     try:
         fix_prompt = f"""修复下面这个 JSON，只输出修复后的 JSON，不要任何解释：
 
@@ -87,7 +188,7 @@ def _llm_json(prompt, max_tokens=900):
         fixed = model.chat_simple([{"role": "user", "content": fix_prompt}], max_tokens=900)
         m_fix = re.search(r'\{[\s\S]*\}', fixed)
         if m_fix:
-            return json.loads(m_fix.group())
+            return _parse_and_validate(m_fix.group())
     except Exception:
         pass
 
@@ -111,6 +212,8 @@ def load_profile(market_code):
             raise FileNotFoundError(f"没有 {market_code} 的画像文件")
     with open(path, encoding="utf-8") as f:
         profile = json.load(f)
+
+    verify_profile_integrity(path, market_code)
 
     today = date.today().isoformat()
     valid, expired = [], []
@@ -149,7 +252,7 @@ def deconstruct(source_text):
   "target_audience": "目标人群",
   "cta": "行动号召（引导用户做什么）"
 }}"""
-    return _llm_json(prompt, max_tokens=500)
+    return _llm_json(prompt, max_tokens=500, schema="deconstruct")
 
 
 # ========== 品牌上下文 ==========
@@ -208,8 +311,7 @@ def recreate(elements, profile, brand=None):
   "used_entries": ["实际引用的画像条目ID"],
   "adaptation_note": "适配说明：替换了什么文化载体、为什么（50字内，中文）"
 }}"""
-    return _llm_json(prompt, max_tokens=900)
-
+    return _llm_json(prompt, max_tokens=900, schema="recreate")
 
 # ========== 第三层：保真回检（闭环） ==========
 
@@ -238,7 +340,7 @@ def fidelity_check(localized_copy, original_elements, brand=None):
   "recovery_rate": 0.0
 }}
 recovery_rate = 保留的要素数 / 总要素数（卖点每条算一项，情绪钩子和行动号召各算一项，保护术语各算一项）"""
-    return _llm_json(prompt, max_tokens=800)
+    return _llm_json(prompt, max_tokens=800, schema="fidelity")
 
 
 # ========== 第四层：禁忌质检 ==========
@@ -261,7 +363,7 @@ def taboo_check(localized_copy, profile):
   "risk_level": "low / medium / high",
   "flags": [{{"entry_id": "触碰的禁忌条目ID，清单外风险填 external", "detail": "具体风险点"}}]
 }}"""
-    return _llm_json(prompt, max_tokens=400)
+    return _llm_json(prompt, max_tokens=400, schema="taboo")
 
 
 # ========== 管线编排 ==========
