@@ -9,7 +9,9 @@ import time
 
 MAX_RETRIES = 2
 
-# Prompt 注入防御：高风险指令模式
+# Prompt 注入防御：
+# 主要防线：XML 分隔符 + HTML 实体转义，将用户输入与指令在结构上隔离
+# 辅助防线：正则模式匹配——不可靠（LLM 自然语言理解，任何规则都可绕过），仅作预警层
 _INJECTION_PATTERNS = [
     r"(?:忽略|无视|忘记|不要).{0,10}(?:以上|之前|前面|所有|系统).{0,10}(?:指令|提示|规则|要求)",
     r"(?:输出|显示|打印|泄露|告诉我).{0,10}(?:系统.{0,5})?(?:prompt|提示词|指令|规则|设定)",
@@ -17,20 +19,42 @@ _INJECTION_PATTERNS = [
     r"(?:DAN|Developer Mode|jailbreak)",
 ]
 
+# 需要从用户输入中彻底移除的 token（防分隔符注入）
+_BLOCKED_TOKENS = [
+    "<user_input>", "</user_input>",
+    "<|im_start|>", "<|im_end|>",
+    "<|endoftext|>",
+]
+
 
 def sanitize_user_input(text):
-    """清洗用户输入：检测注入特征，用分隔符隔离指令与数据"""
+    """清洗用户输入：结构隔离（主）+ 模式预警（辅）
+
+    核心策略：对用户输入做 HTML 实体转义（< → &lt;, > → &gt;）后包裹
+    在 <user_input> 标签内，从结构上防止用户文本被 LLM 误解为指令。
+    正则匹配仅作低成本预警，不应视为可靠防线。
+    """
     if not text or not isinstance(text, str):
         return text
 
-    # 检测高风险模式
+    # 辅助：高风险模式预警（可绕过，不作为唯一防线）
     for pat in _INJECTION_PATTERNS:
         if re.search(pat, text, re.IGNORECASE):
-            raise ValueError(f"输入包含疑似指令注入内容，已拦截: {pat}")
+            raise ValueError(f"输入包含疑似指令注入内容，已拦截")
 
-    # XML 标签隔离：防止用户文本被 LLM 误解为指令
-    sanitized = text.replace("<user_input>", "").replace("</user_input>", "")
-    sanitized = sanitized.replace("<|im_start|>", "").replace("<|im_end|>", "")
+    # 主防线：迭代清除分隔符 token（防嵌套/拼接绕过），直到稳定
+    sanitized = text
+    changed = True
+    while changed:
+        changed = False
+        for token in _BLOCKED_TOKENS:
+            if token in sanitized:
+                sanitized = sanitized.replace(token, "")
+                changed = True
+
+    # HTML 实体转义：用户输入中的 < > 变成 &lt; &gt;，无法形成 XML 标签
+    sanitized = sanitized.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     return f"<user_input>\n{sanitized}\n</user_input>"
 
 
