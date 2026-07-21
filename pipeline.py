@@ -425,17 +425,28 @@ def localize(source_text, market_code, brand=None, verbose=True):
 
 
 if __name__ == "__main__":
-    demo_creative = (
+    import argparse
+
+    parser = argparse.ArgumentParser(description="LocalPipe 创意本地化管线")
+    parser.add_argument("--gen-hashes", action="store_true", help="生成/更新画像文件 SHA256 基线")
+    parser.add_argument("--market", default="th", help="目标市场代码（默认 th）")
+    parser.add_argument("--source", type=str, help="源文案文本")
+    args = parser.parse_args()
+
+    if args.gen_hashes:
+        gen_profile_hashes()
+        sys.exit(0)
+
+    demo_creative = args.source if args.source else (
         "这个夏天，别让手机先中暑！CoolClip散热背夹，3秒降温15度，"
         "开黑五连坐照样稳如老狗。学生党福音，一杯奶茶钱，游戏体验直接起飞。"
     )
     brand = load_brand_context()
-    output = localize(demo_creative, "th", brand=brand)
+    output = localize(demo_creative, args.market, brand=brand)
     print("\n" + "=" * 50)
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
-    # 保存样例到 examples/
-    out_path = os.path.join(BASE_DIR, "examples", "thailand_demo.json")
+    out_path = os.path.join(BASE_DIR, "examples", f"{args.market}_demo.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
     print(f"\n样例已保存: {out_path}")

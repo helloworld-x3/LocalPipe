@@ -9,6 +9,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 from pipeline import _llm_json, load_profile, load_dotenv
+from model import sanitize_user_input
 
 load_dotenv()
 
@@ -25,7 +26,7 @@ def localize_baseline(source_text, market_code):
     prompt = f"""你是{market}人。把下面的中国营销文案改成{market}本地化的版本，用{language}写，要求一定要符合本地人的表达习惯，提高顾客购买率。
 
 【文案】
-{source_text}
+{sanitize_user_input(source_text)}
 
 输出 JSON：
 {{
