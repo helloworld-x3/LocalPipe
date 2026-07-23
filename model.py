@@ -6,6 +6,7 @@ import re
 import sys
 import json
 import time
+import hashlib
 import threading
 
 MAX_RETRIES = 2
@@ -210,3 +211,68 @@ def safe_print(*args, end="\n", flush=False, **kwargs):
         sys.stdout.write(text)
     if flush:
         sys.stdout.flush()
+
+
+# ========== LLM 响应缓存 ==========
+
+class Cache:
+    """文件级缓存：避免重复 API 调用。线程安全。"""
+
+    def __init__(self, cache_dir=None, max_entries=1000):
+        if cache_dir is None:
+            cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+        self.cache_dir = cache_dir
+        self.cache_file = os.path.join(cache_dir, "llm_cache.json")
+        self._data = None
+        self._max_entries = max_entries
+        self._lock = threading.Lock()
+
+    def _load(self):
+        if self._data is not None:
+            return
+        os.makedirs(self.cache_dir, exist_ok=True)
+        if os.path.isfile(self.cache_file):
+            try:
+                with open(self.cache_file, encoding="utf-8") as f:
+                    self._data = json.load(f)
+            except Exception:
+                self._data = {}
+        else:
+            self._data = {}
+
+    def get(self, key):
+        with self._lock:
+            self._load()
+            entry = self._data.get(key)
+            return entry["value"] if entry else None
+
+    def set(self, key, value):
+        with self._lock:
+            self._load()
+            self._data[key] = {"value": value, "ts": time.time()}
+            if len(self._data) > self._max_entries:
+                keys = sorted(self._data, key=lambda k: self._data[k]["ts"], reverse=True)
+                self._data = {k: self._data[k] for k in keys[:self._max_entries]}
+            os.makedirs(self.cache_dir, exist_ok=True)
+            with open(self.cache_file, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
+
+
+# ========== 遥测日志 ==========
+
+class Telemetry:
+    """结构化遥测：耗时、token、成功率。JSONL 追加写入。"""
+
+    def __init__(self, log_dir=None):
+        if log_dir is None:
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+        self.log_dir = log_dir
+        self.log_file = os.path.join(log_dir, "telemetry.jsonl")
+        self._lock = threading.Lock()
+
+    def log(self, entry):
+        entry["ts"] = time.time()
+        os.makedirs(self.log_dir, exist_ok=True)
+        with self._lock:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")

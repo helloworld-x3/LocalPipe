@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import time
 import hashlib
 from datetime import date
 
@@ -32,10 +33,19 @@ def load_dotenv():
 
 load_dotenv()
 
-from model import ModelClient, ModelConfig, sanitize_user_input
+from model import ModelClient, ModelConfig, sanitize_user_input, Cache, Telemetry
 
 FIDELITY_THRESHOLD = 0.7  # 要素回收率低于此值自动重生成。初始经验值，W1 实验中对比不同阈值下的母语者评分以确定最优值（计划测试 0.6/0.7/0.8 三档）
 MAX_RETRIES = 2
+RETRY_BACKOFF = [1, 2, 4]  # _llm_json 退避重试间隔（秒）
+
+_cache = Cache()
+_telemetry = Telemetry()
+
+
+def _make_cache_key(prompt, model, max_tokens):
+    raw = f"{model}|{max_tokens}|{prompt}"
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 # ========== JSON Schema 校验（响应完整性） ==========
@@ -128,10 +138,8 @@ def gen_profile_hashes():
     return hashes
 
 
-def _llm_json(prompt, max_tokens=900, schema=None):
-    config = ModelConfig()
-    model = ModelClient(config)
-    text = model.chat_simple([{"role": "user", "content": prompt}], max_tokens=max_tokens)
+def _parse_json_text(text, schema, model=None):
+    """4 级 JSON 解析：直接解析 → 转义修复 → ast.literal_eval → LLM 修复"""
 
     def _parse_and_validate(raw):
         data = json.loads(raw)
@@ -139,7 +147,6 @@ def _llm_json(prompt, max_tokens=900, schema=None):
             validate_schema(data, schema)
         return data
 
-    # 先试 json.loads
     m = re.search(r'\{[\s\S]*\}', text)
     if not m:
         m2 = re.search(r'\[[\s\S]*\]', text)
@@ -179,20 +186,47 @@ def _llm_json(prompt, max_tokens=900, schema=None):
         pass
 
     # 尝试 4: 让 LLM 修复（兜底）
-    try:
-        fix_prompt = f"""修复下面这个 JSON，只输出修复后的 JSON，不要任何解释：
+    if model:
+        try:
+            fix_prompt = f"""修复下面这个 JSON，只输出修复后的 JSON，不要任何解释：
 
 {raw}
 
 错误：格式不合法。修复它："""
-        fixed = model.chat_simple([{"role": "user", "content": fix_prompt}], max_tokens=900)
-        m_fix = re.search(r'\{[\s\S]*\}', fixed)
-        if m_fix:
-            return _parse_and_validate(m_fix.group())
-    except Exception:
-        pass
+            fixed = model.chat_simple([{"role": "user", "content": fix_prompt}], max_tokens=900)
+            m_fix = re.search(r'\{[\s\S]*\}', fixed)
+            if m_fix:
+                return _parse_and_validate(m_fix.group())
+        except Exception:
+            pass
 
     raise ValueError(f"LLM返回的JSON经4次修复仍无法解析: {raw[:300]}")
+
+
+def _llm_json(prompt, max_tokens=900, schema=None):
+    config = ModelConfig()
+    model = ModelClient(config)
+
+    cache_key = _make_cache_key(prompt, config.model, max_tokens)
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    last_error = None
+    for attempt in range(len(RETRY_BACKOFF) + 1):
+        try:
+            text = model.chat_simple([{"role": "user", "content": prompt}], max_tokens=max_tokens)
+            result = _parse_json_text(text, schema, model=model)
+            _cache.set(cache_key, result)
+            return result
+        except Exception as e:
+            last_error = e
+            if attempt < len(RETRY_BACKOFF):
+                wait = RETRY_BACKOFF[attempt]
+                print(f"  [_llm_json 重试 {attempt + 1}/{len(RETRY_BACKOFF)}，{wait}s 后] {e}")
+                time.sleep(wait)
+
+    raise last_error
 
 
 # ========== 画像库 ==========
@@ -374,20 +408,32 @@ def localize(source_text, market_code, brand=None, verbose=True):
         if verbose:
             print(msg)
 
+    t_start = time.time()
+    timings = {}
+    fidelity_retries = 0
+
     profile = load_profile(market_code)
     log(f"[画像] {profile['market']} {profile['version']}，有效条目 {len(profile['entries'])}，过期剔除 {len(profile['_expired_ids'])}")
 
     log("[1/4] 创意解构...")
+    t1 = time.time()
     elements = deconstruct(source_text)
+    timings["deconstruct_ms"] = round((time.time() - t1) * 1000)
     log(f"  卖点: {elements.get('selling_points')} | 钩子: {elements.get('emotion_hook', '')[:30]}")
 
     result = None
     for attempt in range(1 + MAX_RETRIES):
+        if attempt > 0:
+            fidelity_retries += 1
         log(f"[2/4] 本地化重创作{'（重试 ' + str(attempt) + '）' if attempt else ''}...")
+        t2 = time.time()
         creation = recreate(elements, profile, brand)
+        timings["recreate_ms"] = round((time.time() - t2) * 1000)
 
         log("[3/4] 保真回检...")
+        t3 = time.time()
         fidelity = fidelity_check(creation["copy"], elements, brand)
+        timings["fidelity_ms"] = round((time.time() - t3) * 1000)
         rate = fidelity.get("recovery_rate", 0)
         log(f"  要素回收率: {rate:.0%}")
 
@@ -403,8 +449,24 @@ def localize(source_text, market_code, brand=None, verbose=True):
     creation, fidelity = result
 
     log("[4/4] 禁忌质检...")
+    t4 = time.time()
     taboo = taboo_check(creation["copy"], profile)
+    timings["taboo_ms"] = round((time.time() - t4) * 1000)
     log(f"  风险等级: {taboo.get('risk_level')}")
+
+    final_status = (
+        "pass" if fidelity.get("recovery_rate", 0) >= FIDELITY_THRESHOLD
+        and taboo.get("risk_level") == "low" else "needs_review"
+    )
+    timings["total_ms"] = round((time.time() - t_start) * 1000)
+
+    _telemetry.log({
+        "event": "localize",
+        "market": market_code,
+        "final_status": final_status,
+        "fidelity_retries": fidelity_retries,
+        "timings": timings,
+    })
 
     return {
         "market": profile["market"],
@@ -417,10 +479,7 @@ def localize(source_text, market_code, brand=None, verbose=True):
         "used_entries": creation.get("used_entries", []),
         "fidelity": fidelity,
         "taboo": taboo,
-        "final_status": (
-            "pass" if fidelity.get("recovery_rate", 0) >= FIDELITY_THRESHOLD
-            and taboo.get("risk_level") == "low" else "needs_review"
-        ),
+        "final_status": final_status,
     }
 
 

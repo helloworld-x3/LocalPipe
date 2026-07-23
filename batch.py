@@ -11,6 +11,7 @@ import os
 import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,7 +26,50 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
-def run_batch(creatives_path, market_codes, with_baseline=True):
+def _process_one(creative, market_code, brand, with_baseline):
+    """处理单个 (创意, 市场) 对，返回 (results, blind_items)"""
+    cid = creative.get("id", "")
+    text = creative["text"]
+    results = []
+    blind_items = []
+    print(f"  开始: 创意 {cid} → {market_code}")
+
+    # B组：管线
+    try:
+        b_result = localize(text, market_code, brand=brand)
+        b_result["group"] = "B_pipeline"
+        b_result["creative_id"] = cid
+        results.append(b_result)
+        blind_items.append({
+            "sample_id": None,
+            "market": market_code,
+            "copy": b_result["copy"],
+            "_group": "B",
+            "_creative_id": cid,
+        })
+    except Exception as e:
+        print(f"  B组失败 [{cid}→{market_code}]: {e}")
+
+    # A组：裸Prompt
+    if with_baseline:
+        try:
+            a_result = localize_baseline(text, market_code)
+            a_result["creative_id"] = cid
+            results.append(a_result)
+            blind_items.append({
+                "sample_id": None,
+                "market": market_code,
+                "copy": a_result["copy"],
+                "_group": "A",
+                "_creative_id": cid,
+            })
+        except Exception as e:
+            print(f"  A组失败 [{cid}→{market_code}]: {e}")
+
+    return results, blind_items
+
+
+def run_batch(creatives_path, market_codes, with_baseline=True, workers=3):
     with open(creatives_path, encoding="utf-8") as f:
         creatives = json.load(f)
 
@@ -35,49 +79,30 @@ def run_batch(creatives_path, market_codes, with_baseline=True):
 
     full_results = []
     blind_items = []
-
     total = len(creatives) * len(market_codes)
-    done = 0
-    for c in creatives:
-        cid = c.get("id", "")
-        text = c["text"]
-        for mc in market_codes:
+
+    tasks = [(c, mc) for c in creatives for mc in market_codes]
+    actual_workers = min(workers, total) if total > 0 else 1
+
+    print(f"批量: {len(creatives)} 创意 × {len(market_codes)} 市场 = {total} 任务，并发数 {actual_workers}")
+
+    with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+        futures = {
+            executor.submit(_process_one, c, mc, brand, with_baseline): (c.get("id", ""), mc)
+            for c, mc in tasks
+        }
+
+        done = 0
+        for future in as_completed(futures):
+            cid, mc = futures[future]
             done += 1
-            print(f"\n===== [{done}/{total}] 创意 {cid} → {mc} =====")
-
-            # B组：管线
             try:
-                b_result = localize(text, mc, brand=brand)
-                b_result["group"] = "B_pipeline"
-                b_result["creative_id"] = cid
-                full_results.append(b_result)
-                blind_items.append({
-                    "sample_id": None,  # 混排后统一编号
-                    "market": mc,
-                    "copy": b_result["copy"],
-                    "_group": "B",
-                    "_creative_id": cid,
-                })
+                r, b = future.result()
+                full_results.extend(r)
+                blind_items.extend(b)
+                print(f"  [{done}/{total}] 完成: {cid} → {mc}")
             except Exception as e:
-                print(f"  B组失败: {e}")
-
-            # A组：裸Prompt
-            if with_baseline:
-                try:
-                    a_result = localize_baseline(text, mc)
-                    a_result["creative_id"] = cid
-                    full_results.append(a_result)
-                    blind_items.append({
-                        "sample_id": None,
-                        "market": mc,
-                        "copy": a_result["copy"],
-                        "_group": "A",
-                        "_creative_id": cid,
-                    })
-                except Exception as e:
-                    print(f"  A组失败: {e}")
-
-            time.sleep(1)
+                print(f"  [{done}/{total}] 失败: {cid} → {mc}: {e}")
 
     # 盲测集：打乱 + 去标识
     random.shuffle(blind_items)
@@ -111,6 +136,16 @@ def run_batch(creatives_path, market_codes, with_baseline=True):
 
 
 if __name__ == "__main__":
-    creatives_file = sys.argv[1] if len(sys.argv) > 1 else os.path.join(BASE_DIR, "examples", "creatives.json")
-    markets = (sys.argv[2] if len(sys.argv) > 2 else "th").split(",")
-    run_batch(creatives_file, markets)
+    import argparse
+    parser = argparse.ArgumentParser(description="LocalPipe 批量本地化 + 盲测集生成")
+    parser.add_argument("creatives", nargs="?", default=os.path.join(BASE_DIR, "examples", "creatives.json"),
+                        help="创意 JSON 文件路径")
+    parser.add_argument("markets", nargs="?", default="th",
+                        help="目标市场代码，逗号分隔（默认 th）")
+    parser.add_argument("--workers", "-w", type=int, default=3,
+                        help="并发数（默认 3）")
+    parser.add_argument("--no-baseline", action="store_true",
+                        help="跳过 A 组裸 Prompt")
+    args = parser.parse_args()
+    run_batch(args.creatives, args.markets.split(","),
+              with_baseline=not args.no_baseline, workers=args.workers)
