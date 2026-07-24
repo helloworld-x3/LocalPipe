@@ -35,7 +35,7 @@ load_dotenv()
 
 from model import ModelClient, ModelConfig, sanitize_user_input, Cache, Telemetry
 
-FIDELITY_THRESHOLD = 0.7  # 要素回收率低于此值自动重生成。初始经验值，W1 实验中对比不同阈值下的母语者评分以确定最优值（计划测试 0.6/0.7/0.8 三档）
+FIDELITY_THRESHOLD = float(os.environ.get("FIDELITY_THRESHOLD", "0.7"))
 MAX_RETRIES = 2
 RETRY_BACKOFF = [1, 2, 4]  # _llm_json 退避重试间隔（秒）
 
@@ -403,7 +403,8 @@ def taboo_check(localized_copy, profile):
 # ========== 管线编排 ==========
 
 def localize(source_text, market_code, brand=None, verbose=True):
-    """完整管线：一条中文创意 → 一个市场的本地化产出（含追溯与质检数据）"""
+    """完整管线：一条中文创意 → 一个市场的本地化产出（含追溯与质检数据）
+    单层失败不崩全链路，返回部分结果 + error 字段。"""
     def log(msg):
         if verbose:
             print(msg)
@@ -411,53 +412,93 @@ def localize(source_text, market_code, brand=None, verbose=True):
     t_start = time.time()
     timings = {}
     fidelity_retries = 0
+    errors = []
 
-    profile = load_profile(market_code)
-    log(f"[画像] {profile['market']} {profile['version']}，有效条目 {len(profile['entries'])}，过期剔除 {len(profile['_expired_ids'])}")
+    # [0] 加载画像（画像失败无法继续）
+    try:
+        profile = load_profile(market_code)
+        log(f"[画像] {profile['market']} {profile['version']}，有效条目 {len(profile['entries'])}，过期剔除 {len(profile['_expired_ids'])}")
+    except Exception as e:
+        log(f"[画像] 加载失败: {e}")
+        _telemetry.log({"event": "localize", "market": market_code, "error": f"profile_load: {e}"})
+        return {
+            "market": market_code,
+            "source_text": source_text,
+            "error": f"画像加载失败: {e}",
+            "final_status": "error",
+        }
 
+    # [1] 创意解构
     log("[1/4] 创意解构...")
     t1 = time.time()
-    elements = deconstruct(source_text)
-    timings["deconstruct_ms"] = round((time.time() - t1) * 1000)
-    log(f"  卖点: {elements.get('selling_points')} | 钩子: {elements.get('emotion_hook', '')[:30]}")
+    try:
+        elements = deconstruct(source_text)
+        timings["deconstruct_ms"] = round((time.time() - t1) * 1000)
+        log(f"  卖点: {elements.get('selling_points')} | 钩子: {elements.get('emotion_hook', '')[:30]}")
+    except Exception as e:
+        log(f"  解构失败: {e}")
+        timings.update({"deconstruct_ms": round((time.time() - t1) * 1000), "total_ms": round((time.time() - t_start) * 1000)})
+        _telemetry.log({"event": "localize", "market": market_code, "error": f"deconstruct: {e}", "timings": timings})
+        return {
+            "market": profile["market"],
+            "source_text": source_text,
+            "error": f"创意解构失败: {e}",
+            "final_status": "error",
+        }
 
-    result = None
-    for attempt in range(1 + MAX_RETRIES):
-        if attempt > 0:
-            fidelity_retries += 1
-        log(f"[2/4] 本地化重创作{'（重试 ' + str(attempt) + '）' if attempt else ''}...")
-        t2 = time.time()
-        creation = recreate(elements, profile, brand)
-        timings["recreate_ms"] = round((time.time() - t2) * 1000)
+    # [2+3] 重创作 + 保真回检（带 fidelity 打回循环）
+    creation = None
+    fidelity = None
+    try:
+        for attempt in range(1 + MAX_RETRIES):
+            if attempt > 0:
+                fidelity_retries += 1
+            log(f"[2/4] 本地化重创作{'（重试 ' + str(attempt) + '）' if attempt else ''}...")
+            t2 = time.time()
+            creation = recreate(elements, profile, brand)
+            timings["recreate_ms"] = round((time.time() - t2) * 1000)
 
-        log("[3/4] 保真回检...")
-        t3 = time.time()
-        fidelity = fidelity_check(creation["copy"], elements, brand)
-        timings["fidelity_ms"] = round((time.time() - t3) * 1000)
-        rate = fidelity.get("recovery_rate", 0)
-        log(f"  要素回收率: {rate:.0%}")
+            log("[3/4] 保真回检...")
+            t3 = time.time()
+            fidelity = fidelity_check(creation["copy"], elements, brand)
+            timings["fidelity_ms"] = round((time.time() - t3) * 1000)
+            rate = fidelity.get("recovery_rate", 0)
+            log(f"  要素回收率: {rate:.0%}")
 
-        if rate >= FIDELITY_THRESHOLD:
-            result = (creation, fidelity)
-            break
-        missing = [c["element"] for c in fidelity.get("checks", []) if not c.get("recovered")]
-        log(f"  低于阈值 {FIDELITY_THRESHOLD:.0%}，丢失要素: {missing}，打回重做")
-        elements["_retry_hint"] = f"上一版丢失了这些要素，重做时必须保留: {missing}"
+            if rate >= FIDELITY_THRESHOLD:
+                break
+            missing = [c["element"] for c in fidelity.get("checks", []) if not c.get("recovered")]
+            log(f"  低于阈值 {FIDELITY_THRESHOLD:.0%}，丢失要素: {missing}，打回重做")
+            elements["_retry_hint"] = f"上一版丢失了这些要素，重做时必须保留: {missing}"
+    except Exception as e:
+        log(f"  重创作/回检失败: {e}")
+        errors.append(f"recreate/fidelity: {e}")
 
-    if result is None:
-        result = (creation, fidelity)  # 重试用尽，带低分标记交付
-    creation, fidelity = result
+    # [4] 禁忌质检
+    taboo = None
+    if creation:
+        try:
+            log("[4/4] 禁忌质检...")
+            t4 = time.time()
+            taboo = taboo_check(creation["copy"], profile)
+            timings["taboo_ms"] = round((time.time() - t4) * 1000)
+            log(f"  风险等级: {taboo.get('risk_level')}")
+        except Exception as e:
+            log(f"  禁忌质检失败: {e}")
+            errors.append(f"taboo: {e}")
+            taboo = {"risk_level": "unknown", "flags": [], "_error": str(e)}
 
-    log("[4/4] 禁忌质检...")
-    t4 = time.time()
-    taboo = taboo_check(creation["copy"], profile)
-    timings["taboo_ms"] = round((time.time() - t4) * 1000)
-    log(f"  风险等级: {taboo.get('risk_level')}")
+    # 组装结果
+    if creation and fidelity:
+        final_status = (
+            "pass" if fidelity.get("recovery_rate", 0) >= FIDELITY_THRESHOLD
+            and (taboo or {}).get("risk_level") == "low" else "needs_review"
+        )
+    elif creation:
+        final_status = "needs_review"
+    else:
+        final_status = "error"
 
-    final_status = (
-        "pass" if fidelity.get("recovery_rate", 0) >= FIDELITY_THRESHOLD
-        and taboo.get("risk_level") == "low" else "needs_review"
-    )
     timings["total_ms"] = round((time.time() - t_start) * 1000)
 
     _telemetry.log({
@@ -465,6 +506,7 @@ def localize(source_text, market_code, brand=None, verbose=True):
         "market": market_code,
         "final_status": final_status,
         "fidelity_retries": fidelity_retries,
+        "errors": errors,
         "timings": timings,
     })
 
@@ -472,14 +514,15 @@ def localize(source_text, market_code, brand=None, verbose=True):
         "market": profile["market"],
         "profile_version": profile["version"],
         "source_text": source_text,
-        "elements": elements,
-        "copy": creation.get("copy", ""),
-        "copy_zh": creation.get("copy_zh", ""),
-        "adaptation_note": creation.get("adaptation_note", ""),
-        "used_entries": creation.get("used_entries", []),
+        "elements": elements if creation else None,
+        "copy": creation.get("copy", "") if creation else "",
+        "copy_zh": creation.get("copy_zh", "") if creation else "",
+        "adaptation_note": creation.get("adaptation_note", "") if creation else "",
+        "used_entries": creation.get("used_entries", []) if creation else [],
         "fidelity": fidelity,
         "taboo": taboo,
         "final_status": final_status,
+        "errors": errors if errors else None,
     }
 
 
