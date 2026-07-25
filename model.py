@@ -74,6 +74,9 @@ def sanitize_user_input(text):
     # 辅助：高风险模式预警（可绕过，不作为唯一防线，仅记录不阻断）
     for pat in _INJECTION_PATTERNS:
         if re.search(pat, text, re.IGNORECASE):
+            # 2026-07-25 安全审计修复：原 raise ValueError 会误杀正常文案
+# （如"不要忘记领取优惠券"），且纯英文注入可绕过中文正则。
+# 主防线 XML 结构隔离已足够，正则仅作预警日志。
             warnings.warn(f"输入包含疑似指令注入内容（PAT={pat[:40]}...），已记录但不阻断")
 
     # 主防线：迭代清除分隔符 token（防嵌套/拼接绕过），直到稳定
@@ -95,7 +98,7 @@ def sanitize_user_input(text):
 class ModelConfig:
     def __init__(self):
         self.api_key = (
-            os.environ.get("LLM_API_KEY")
+            os.environ.get("LLM_API_KEY")  # 2026-07-25 新增泛化变量名，兼容旧环境变量
             or os.environ.get("DEEPSEEK_API_KEY")
             or os.environ.get("DASHSCOPE_API_KEY")
             or os.environ.get("OPENAI_API_KEY")
