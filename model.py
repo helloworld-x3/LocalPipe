@@ -8,6 +8,7 @@ import json
 import time
 import hashlib
 import threading
+import warnings
 
 MAX_RETRIES = 2
 
@@ -70,10 +71,10 @@ def sanitize_user_input(text):
     if not text or not isinstance(text, str):
         return text
 
-    # 辅助：高风险模式预警（可绕过，不作为唯一防线）
+    # 辅助：高风险模式预警（可绕过，不作为唯一防线，仅记录不阻断）
     for pat in _INJECTION_PATTERNS:
         if re.search(pat, text, re.IGNORECASE):
-            raise ValueError(f"输入包含疑似指令注入内容，已拦截")
+            warnings.warn(f"输入包含疑似指令注入内容（PAT={pat[:40]}...），已记录但不阻断")
 
     # 主防线：迭代清除分隔符 token（防嵌套/拼接绕过），直到稳定
     sanitized = text
@@ -94,7 +95,8 @@ def sanitize_user_input(text):
 class ModelConfig:
     def __init__(self):
         self.api_key = (
-            os.environ.get("DEEPSEEK_API_KEY")
+            os.environ.get("LLM_API_KEY")
+            or os.environ.get("DEEPSEEK_API_KEY")
             or os.environ.get("DASHSCOPE_API_KEY")
             or os.environ.get("OPENAI_API_KEY")
         )
