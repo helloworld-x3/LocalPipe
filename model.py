@@ -104,7 +104,7 @@ class ModelConfig:
             or os.environ.get("OPENAI_API_KEY")
         )
         self.base_url = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
-        self.model = os.environ.get("LLM_MODEL", "deepseek-chat")
+        self.model = os.environ.get("LLM_MODEL", "deepseek-v4-pro")
 
     @property
     def provider_name(self):
@@ -148,16 +148,17 @@ class ModelClient:
                     time.sleep(2)
         raise last_error
 
-    def chat_simple(self, messages, max_tokens=200):
-        """非流式调用，返回纯文本。用于内部工具（如语义搜索）"""
+    def chat_simple(self, messages, max_tokens=200, response_format=None):
+        """非流式调用，返回纯文本。v4-pro 默认开思考，关掉省 token"""
         _rate_limiter.acquire()
         try:
-            resp = self.client.chat.completions.create(
-                model=self.config.model,
-                messages=messages,
-                max_tokens=max_tokens,
-                timeout=30,
+            kwargs = dict(
+                model=self.config.model, messages=messages, max_tokens=max_tokens, timeout=30,
+                extra_body={"thinking": {"type": "disabled"}},
             )
+            if response_format:
+                kwargs["response_format"] = response_format
+            resp = self.client.chat.completions.create(**kwargs)
             return resp.choices[0].message.content
         except Exception as e:
             raise RuntimeError(f"LLM 调用失败: {e}")

@@ -215,7 +215,7 @@ def _llm_json(prompt, max_tokens=900, schema=None):
     last_error = None
     for attempt in range(len(RETRY_BACKOFF) + 1):
         try:
-            text = model.chat_simple([{"role": "user", "content": prompt}], max_tokens=max_tokens)
+            text = model.chat_simple([{"role": "user", "content": prompt}], max_tokens=max_tokens, response_format={"type": "json_object"})
             result = _parse_json_text(text, schema, model=model)
             _cache.set(cache_key, result)
             return result
@@ -325,6 +325,8 @@ def recreate(elements, profile, brand=None):
     brand_text = brand_rules_text(brand)
 
     prompt = f"""你是{market}本地资深广告创意人。基于创意要素和{market}文化画像，用{language}重新创作一版营销文案。
+
+严格只输出下方 JSON 结构，不要前言、不要后记、不要解释：
 
 要求：
 1. 保留全部核心卖点、情绪结构和行动号召，但文化载体（梗、场景、表达方式）全部替换为{market}本地的
