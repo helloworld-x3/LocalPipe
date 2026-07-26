@@ -5,6 +5,7 @@
   outputs/batch_<时间戳>.json   全量结果（含追溯质检数据，B组）
   outputs/blind_<时间戳>.json   盲测集（A/B混排去标识，评审用）
   outputs/key_<时间戳>.json     揭盲对照表（评审结束前不发）
+  outputs/skipped_<时间戳>.json 未进入盲测的 A/B 配对及原因
 """
 import json
 import os
@@ -27,19 +28,41 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 
 
 def _process_one(creative, market_code, brand, with_baseline):
-    """处理单个 (创意, 市场) 对，返回 (results, blind_items)"""
+    """处理单个 (创意, 市场) 对，A/B 严格配对进盲测"""
     cid = creative.get("id", "")
     text = creative["text"]
     results = []
     blind_items = []
+    skipped_pairs = []
     print(f"  开始: 创意 {cid} → {market_code}")
 
-    # B组：管线
+    # 先分别计算 A、B
+    b_result = None
+    a_result = None
+
     try:
         b_result = localize(text, market_code, brand=brand)
         b_result["group"] = "B_pipeline"
         b_result["creative_id"] = cid
         results.append(b_result)
+    except Exception as e:
+        print(f"  B组异常 [{cid}→{market_code}]: {e}")
+        b_result = {"copy": "", "final_status": "error", "_error": str(e)}
+
+    if with_baseline:
+        try:
+            a_result = localize_baseline(text, market_code)
+            a_result["creative_id"] = cid
+            results.append(a_result)
+        except Exception as e:
+            print(f"  A组异常 [{cid}→{market_code}]: {e}")
+            a_result = {"copy": "", "_error": str(e)}
+
+    # 严格配对：A和B都非空且B非error才一起进盲测
+    b_ok = b_result and b_result.get("copy") and b_result.get("final_status") != "error"
+    a_ok = a_result and a_result.get("copy") if with_baseline else True
+
+    if with_baseline and a_ok and b_ok:
         blind_items.append({
             "sample_id": None,
             "market": market_code,
@@ -47,26 +70,32 @@ def _process_one(creative, market_code, brand, with_baseline):
             "_group": "B",
             "_creative_id": cid,
         })
-    except Exception as e:
-        print(f"  B组失败 [{cid}→{market_code}]: {e}")
+        blind_items.append({
+            "sample_id": None,
+            "market": market_code,
+            "copy": a_result["copy"],
+            "_group": "A",
+            "_creative_id": cid,
+        })
+    elif with_baseline:
+        reason = []
+        if not b_ok:
+            reason.append(f"B:final_status={b_result.get('final_status') if b_result else 'N/A'}")
+        if not a_ok:
+            reason.append("A:copy空")
+        pair_key = f"{cid}→{market_code}"
+        skipped_pairs.append({"pair": pair_key, "reason": "; ".join(reason)})
+        print(f"  整对跳过盲测 [{pair_key}]: {skipped_pairs[-1]['reason']}")
+    elif not with_baseline and b_ok:
+        blind_items.append({
+            "sample_id": None,
+            "market": market_code,
+            "copy": b_result["copy"],
+            "_group": "B",
+            "_creative_id": cid,
+        })
 
-    # A组：裸Prompt
-    if with_baseline:
-        try:
-            a_result = localize_baseline(text, market_code)
-            a_result["creative_id"] = cid
-            results.append(a_result)
-            blind_items.append({
-                "sample_id": None,
-                "market": market_code,
-                "copy": a_result["copy"],
-                "_group": "A",
-                "_creative_id": cid,
-            })
-        except Exception as e:
-            print(f"  A组失败 [{cid}→{market_code}]: {e}")
-
-    return results, blind_items
+    return results, blind_items, skipped_pairs
 
 
 def run_batch(creatives_path, market_codes, with_baseline=True, workers=3):
@@ -79,6 +108,7 @@ def run_batch(creatives_path, market_codes, with_baseline=True, workers=3):
 
     full_results = []
     blind_items = []
+    all_skipped = []
     total = len(creatives) * len(market_codes)
 
     tasks = [(c, mc) for c in creatives for mc in market_codes]
@@ -97,9 +127,10 @@ def run_batch(creatives_path, market_codes, with_baseline=True, workers=3):
             cid, mc = futures[future]
             done += 1
             try:
-                r, b = future.result()
+                r, b, skipped = future.result()
                 full_results.extend(r)
                 blind_items.extend(b)
+                all_skipped.extend(skipped)
                 print(f"  [{done}/{total}] 完成: {cid} → {mc}")
             except Exception as e:
                 print(f"  [{done}/{total}] 失败: {cid} → {mc}: {e}")
@@ -123,13 +154,18 @@ def run_batch(creatives_path, market_codes, with_baseline=True, workers=3):
         })
 
     paths = {}
-    for name, data in [("batch", full_results), ("blind", blind), ("key", key)]:
+    for name, data in [("batch", full_results), ("blind", blind), ("key", key), ("skipped", all_skipped)]:
         p = os.path.join(BASE_DIR, "outputs", f"{name}_{ts}.json")
         with open(p, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         paths[name] = p
 
-    print(f"\n完成: {len(full_results)} 条产出")
+    if all_skipped:
+        print(f"\n跳过配对: {len(all_skipped)} 对")
+        for s in all_skipped:
+            print(f"  {s['pair']}: {s['reason']}")
+
+    print(f"\n完成: {len(full_results)} 条产出, {len(blind_items)} 条入盲测")
     for name, p in paths.items():
         print(f"  {name}: {p}")
     return paths

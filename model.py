@@ -65,7 +65,8 @@ def sanitize_user_input(text):
     """清洗用户输入：结构隔离（主）+ 模式预警（辅）
 
     核心策略：对用户输入做 HTML 实体转义（< → &lt;, > → &gt;）后包裹
-    在 <user_input> 标签内，从结构上防止用户文本被 LLM 误解为指令。
+    在 <user_input> 标签内，降低用户文本被 LLM 误解为指令的风险。
+    注意：XML 隔离不能阻止自然语言指令注入，仅作为结构性防护层。
     正则匹配仅作低成本预警，不应视为可靠防线。
     """
     if not text or not isinstance(text, str):

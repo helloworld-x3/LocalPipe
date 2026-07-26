@@ -43,8 +43,8 @@ _cache = Cache()
 _telemetry = Telemetry()
 
 
-def _make_cache_key(prompt, model, max_tokens):
-    raw = f"{model}|{max_tokens}|{prompt}"
+def _make_cache_key(prompt, model, max_tokens, base_url):
+    raw = f"{base_url}|{model}|{max_tokens}|{prompt}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -101,7 +101,7 @@ def _load_hashes():
 
 
 def verify_profile_integrity(path, market_code):
-    """SHA256 验签——防画像文件被篡改"""
+    """SHA256 版本完整性校验——检测画像文件意外修改"""
     hashes = _load_hashes()
     if market_code not in hashes:
         return  # 无基线哈希，跳过（首次使用需先 gen_profile_hashes）
@@ -114,7 +114,7 @@ def verify_profile_integrity(path, market_code):
         raise RuntimeError(
             f"画像完整性校验失败: {market_code}.json 的 SHA256 不匹配！"
             f"预期 {expected[:16]}...，实际 {actual[:16]}..."
-            f"如确信文件未被篡改，请执行 gen_profile_hashes() 更新基线"
+            f"如确认为有意修改，请执行 gen_profile_hashes() 更新基线"
         )
 
 
@@ -207,7 +207,7 @@ def _llm_json(prompt, max_tokens=900, schema=None):
     config = ModelConfig()
     model = ModelClient(config)
 
-    cache_key = _make_cache_key(prompt, config.model, max_tokens)
+    cache_key = _make_cache_key(prompt, config.model, max_tokens, config.base_url)
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
@@ -331,7 +331,7 @@ def recreate(elements, profile, brand=None):
 要求：
 1. 保留全部核心卖点、情绪结构和行动号召，但文化载体（梗、场景、表达方式）全部替换为{market}本地的
 2. 产出必须像{market}本地人原创，不是翻译
-3. 主动运用画像中的条目，并在 used_entries 中列出实际用到的条目ID
+3. 主动运用画像中的条目，并在 used_entries 中列出实际用到的条目ID。注意：只能引用 type 非"文化禁忌"的条目，禁忌条目应当规避而非引用
 4. 严格避开画像中的文化禁忌
 {brand_text}
 【创意要素】
@@ -404,6 +404,107 @@ def taboo_check(localized_copy, profile):
 
 # ========== 管线编排 ==========
 
+def compute_recovery_rate(checks):
+    """纯函数：根据 checks 数组计算真实恢复率。
+
+    - checks 为空或非 list → 0.0
+    - 单个 check 缺少 recovered 字段 → 按 False
+    - recovered 必须严格为 True（布尔），字符串 "false" 等真值无效
+    - check 非 dict → 跳过不计入总数和回收数
+    """
+    if not checks or not isinstance(checks, list):
+        return 0.0
+    valid = [c for c in checks if isinstance(c, dict)]
+    if not valid:
+        return 0.0
+    recovered = sum(1 for c in valid if c.get("recovered") is True)
+    return recovered / len(valid)
+
+
+def _build_expected_checks(elements, brand=None):
+    """从源要素构造 (kind, element) 预期项，保留跨类型同文案。"""
+    expected = []
+    seen = set()
+    for sp in elements.get("selling_points", []):
+        if not isinstance(sp, str):
+            raise ValueError("selling_points 中的要素必须是字符串")
+        item = ("selling_point", sp)
+        if sp and item not in seen:
+            expected.append(item)
+            seen.add(item)
+    for kind in ("emotion_hook", "cta"):
+        element = elements.get(kind, "")
+        item = (kind, element)
+        if element and item not in seen:
+            expected.append(item)
+            seen.add(item)
+    if brand and brand.get("protected_terms"):
+        for t in brand["protected_terms"]:
+            term = t.get("term", "") if isinstance(t, dict) else ""
+            item = ("protected_term", term)
+            if term and item not in seen:
+                expected.append(item)
+                seen.add(item)
+    return expected
+
+
+def _evaluate_fidelity_checks(expected, checks):
+    """按 (kind, element) 严格核对 checks，重复或非布尔结果均不通过。"""
+    check_map = {}
+    unexpected = []
+    expected_set = set(expected)
+    for check in checks if isinstance(checks, list) else []:
+        if not isinstance(check, dict):
+            continue
+        kind = check.get("kind")
+        element = check.get("element")
+        if not isinstance(kind, str) or not isinstance(element, str):
+            unexpected.append({
+                "kind": kind,
+                "element": element,
+                "reason": "invalid_key_type",
+            })
+            continue
+        key = (kind, element)
+        if key not in expected_set:
+            unexpected.append({
+                "kind": kind,
+                "element": element,
+                "reason": "unexpected",
+            })
+            continue
+        check_map.setdefault(key, []).append(check)
+
+    matched = []
+    failed = []
+    for key in expected:
+        candidates = check_map.get(key, [])
+        if not candidates:
+            reason = "missing"
+        elif len(candidates) > 1:
+            reason = "duplicate"
+        elif candidates[0].get("recovered") is True:
+            matched.append(key)
+            continue
+        elif isinstance(candidates[0].get("recovered"), bool):
+            reason = "not_recovered"
+        else:
+            reason = "recovered_not_bool"
+        failed.append({"kind": key[0], "element": key[1], "reason": reason})
+
+    rate = len(matched) / len(expected) if expected else 0.0
+    structure_valid = bool(expected) and all(
+        item["reason"] == "not_recovered" for item in failed
+    )
+    return {
+        "rate": rate,
+        "structure_valid": structure_valid,
+        "matched": [{"kind": kind, "element": element} for kind, element in matched],
+        "failed": failed,
+        "unexpected": unexpected,
+    }
+
+
 def localize(source_text, market_code, brand=None, verbose=True):
     """完整管线：一条中文创意 → 一个市场的本地化产出（含追溯与质检数据）
     单层失败不崩全链路，返回部分结果 + error 字段。"""
@@ -451,6 +552,8 @@ def localize(source_text, market_code, brand=None, verbose=True):
     # [2+3] 重创作 + 保真回检（带 fidelity 打回循环）
     creation = None
     fidelity = None
+    verified_recovery_rate = None
+    fidelity_structure_valid = False
     try:
         for attempt in range(1 + MAX_RETRIES):
             if attempt > 0:
@@ -460,18 +563,61 @@ def localize(source_text, market_code, brand=None, verbose=True):
             creation = recreate(elements, profile, brand)
             timings["recreate_ms"] = round((time.time() - t2) * 1000)
 
+            # 校验 used_entries：去重 + 真实性 + 非禁忌
+            all_entry_ids = {e["id"] for e in profile["entries"]}
+            taboo_ids = {e["id"] for e in profile["entries"] if e["type"] == "文化禁忌"}
+            used = list(dict.fromkeys(creation.get("used_entries", [])))  # 去重保序
+            creation["used_entries"] = used  # 写回去重后列表
+            profile_trace = {
+                "valid_ids": [uid for uid in used if uid in all_entry_ids and uid not in taboo_ids],
+                "invalid_ids": [uid for uid in used if uid not in all_entry_ids],
+                "taboo_ids": [uid for uid in used if uid in taboo_ids],
+                "empty_reference": len(used) == 0,
+            }
+            creation["profile_trace"] = profile_trace
+            if profile_trace["invalid_ids"]:
+                log(f"  ⚠ used_entries 含无效ID: {profile_trace['invalid_ids']}")
+            if profile_trace["taboo_ids"]:
+                log(f"  ⚠ used_entries 含禁忌条目: {profile_trace['taboo_ids']}（应为规避而非引用）")
+
             log("[3/4] 保真回检...")
             t3 = time.time()
             fidelity = fidelity_check(creation["copy"], elements, brand)
             timings["fidelity_ms"] = round((time.time() - t3) * 1000)
-            rate = fidelity.get("recovery_rate", 0)
-            log(f"  要素回收率: {rate:.0%}")
 
-            if rate >= FIDELITY_THRESHOLD:
+            expected_checks = _build_expected_checks(elements, brand)
+            evaluation = _evaluate_fidelity_checks(
+                expected_checks, fidelity.get("checks", [])
+            )
+            rate = evaluation["rate"]
+            verified_recovery_rate = rate
+            fidelity_structure_valid = evaluation["structure_valid"]
+            fidelity["recovery_rate"] = rate
+            fidelity["_structure_valid"] = fidelity_structure_valid
+            fidelity["_expected"] = [
+                {"kind": kind, "element": element}
+                for kind, element in expected_checks
+            ]
+            fidelity["_matched"] = evaluation["matched"]
+            fidelity["_failed"] = evaluation["failed"]
+            if evaluation["unexpected"]:
+                fidelity["_unexpected"] = evaluation["unexpected"]
+            log(
+                f"  要素回收率: {rate:.0%} "
+                f"({len(evaluation['matched'])}/{len(expected_checks)} 匹配, 程序重算)"
+            )
+
+            if rate >= FIDELITY_THRESHOLD and fidelity_structure_valid:
                 break
-            missing = [c["element"] for c in fidelity.get("checks", []) if not c.get("recovered")]
-            log(f"  低于阈值 {FIDELITY_THRESHOLD:.0%}，丢失要素: {missing}，打回重做")
-            elements["_retry_hint"] = f"上一版丢失了这些要素，重做时必须保留: {missing}"
+            failed_summary = [
+                f"{item['kind']}:{item['element']}({item['reason']})"
+                for item in evaluation["failed"]
+            ]
+            log(f"  低于阈值 {FIDELITY_THRESHOLD:.0%}，未通过要素: {failed_summary}，打回重做")
+            elements["_retry_hint"] = (
+                "上一版这些要素未通过保真检查，重做时必须保留: "
+                f"{failed_summary}"
+            )
     except Exception as e:
         log(f"  重创作/回检失败: {e}")
         errors.append(f"recreate/fidelity: {e}")
@@ -491,11 +637,24 @@ def localize(source_text, market_code, brand=None, verbose=True):
             taboo = {"risk_level": "unknown", "flags": [], "_error": str(e)}
 
     # 组装结果
+    # profile_trace 非空时至少 needs_review
+    _trace = creation.get("profile_trace", {}) if creation else {}
+    _trace_clean = (
+        not _trace.get("invalid_ids")
+        and not _trace.get("taboo_ids")
+        and not _trace.get("empty_reference")
+    )
     if creation and fidelity:
-        final_status = (
-            "pass" if fidelity.get("recovery_rate", 0) >= FIDELITY_THRESHOLD
-            and (taboo or {}).get("risk_level") == "low" else "needs_review"
-        )
+        if (
+            verified_recovery_rate is not None
+            and verified_recovery_rate >= FIDELITY_THRESHOLD
+            and fidelity_structure_valid
+            and (taboo or {}).get("risk_level") == "low"
+            and _trace_clean
+        ):
+            final_status = "pass"
+        else:
+            final_status = "needs_review"
     elif creation:
         final_status = "needs_review"
     else:
@@ -521,6 +680,7 @@ def localize(source_text, market_code, brand=None, verbose=True):
         "copy_zh": creation.get("copy_zh", "") if creation else "",
         "adaptation_note": creation.get("adaptation_note", "") if creation else "",
         "used_entries": creation.get("used_entries", []) if creation else [],
+        "profile_trace": creation.get("profile_trace", {}) if creation else {},
         "fidelity": fidelity,
         "taboo": taboo,
         "final_status": final_status,

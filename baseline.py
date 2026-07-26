@@ -33,7 +33,7 @@ def localize_baseline(source_text, market_code):
   "copy": "本地化文案（{language}）",
   "copy_zh": "中文回译"
 }}"""
-    result = _llm_json(prompt, max_tokens=600)
+    result = _llm_json(prompt, max_tokens=900)
     return {
         "group": "A_baseline",
         "market": market,
