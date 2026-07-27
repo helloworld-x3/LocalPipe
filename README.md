@@ -1,5 +1,7 @@
 # LocalPipe — AI 创意本地化流水线
 
+[![Tests](https://github.com/helloworld-x3/LocalPipe/actions/workflows/ci.yml/badge.svg)](https://github.com/helloworld-x3/LocalPipe/actions/workflows/ci.yml)
+
 > 输入一版中国创意，批量生成多个国家的本地版本。不是逐字翻译，而是在保留卖点和品牌规则的前提下，重新设计当地语气、文化表达与行动号召。
 >
 > Hello World（x³）· 2026 AI 先锋未来人才大赛 · 易点天下命题
