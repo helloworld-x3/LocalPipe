@@ -63,5 +63,18 @@
       "expires": "2026-12-31",
       "source": "LLM冷启动+公开报告"
     }
-  ]
+  ],
+  "cultural_dimensions": {
+    "framework": "Hofstede 6维文化量表",
+    "dimensions": {
+      "power_distance": 40,
+      "individualism": 91,
+      "masculinity": 62,
+      "uncertainty_avoidance": 46,
+      "long_term_orientation": 26,
+      "indulgence": 68
+    },
+    "source": "Hofstede Insights 公开文化维度数据(geerthofstede.com)，量表分0-100",
+    "usage": "作为语言风格/消费习惯条目置信度的外部佐证，非唯一依据；与真实广告案例、母语者校准互补"
+  }
 }

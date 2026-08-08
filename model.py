@@ -150,19 +150,26 @@ class ModelClient:
         raise last_error
 
     def chat_simple(self, messages, max_tokens=200, response_format=None):
-        """非流式调用，返回纯文本。v4-pro 默认开思考，关掉省 token"""
-        _rate_limiter.acquire()
-        try:
-            kwargs = dict(
-                model=self.config.model, messages=messages, max_tokens=max_tokens, timeout=30,
-                extra_body={"thinking": {"type": "disabled"}},
-            )
-            if response_format:
-                kwargs["response_format"] = response_format
-            resp = self.client.chat.completions.create(**kwargs)
-            return resp.choices[0].message.content
-        except Exception as e:
-            raise RuntimeError(f"LLM 调用失败: {e}")
+        """非流式调用，返回纯文本。v4-pro 默认开思考，关掉省 token。
+        2026-07-30 优化：与 chat_stream 对齐，增加重试"""
+        last_error = None
+        for attempt in range(MAX_RETRIES + 1):
+            _rate_limiter.acquire()
+            try:
+                kwargs = dict(
+                    model=self.config.model, messages=messages, max_tokens=max_tokens, timeout=30,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                if response_format:
+                    kwargs["response_format"] = response_format
+                resp = self.client.chat.completions.create(**kwargs)
+                return resp.choices[0].message.content
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_RETRIES:
+                    safe_print(f"  [chat_simple 重试 {attempt + 1}/{MAX_RETRIES}] {e}")
+                    time.sleep(2)
+        raise RuntimeError(f"LLM 调用失败: {last_error}")
 
     def _process_stream(self, stream):
         content_parts = []

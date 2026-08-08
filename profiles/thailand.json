@@ -27,7 +27,8 @@
       "content": "泰国消费者吃软萌、自嘲式幽默，不吃讽刺和攻击性幽默；口语化表达带语气词（ครับ/ค่ะ）显得亲切",
       "confidence": "中",
       "expires": "2026-12-31",
-      "source": "LLM冷启动"
+      "source": "LLM冷启动+待复核标记",
+      "note": "预热校准(2026-07-30)：现有评论佐证不足，未升置信度；保留待母语者复核"
     },
     {
       "id": "th-004",
@@ -61,5 +62,19 @@
       "expires": "2026-12-31",
       "source": "LLM冷启动+公开报告"
     }
-  ]
+  ],
+  "note": "v0.1冷启动版，已完成低成本预热校准(2026-07-30)：th-003评论佐证不足，保留待母语者复核。母语者校准仍按实验设计排期执行",
+  "cultural_dimensions": {
+    "framework": "Hofstede 6维文化量表",
+    "dimensions": {
+      "power_distance": 64,
+      "individualism": 20,
+      "masculinity": 34,
+      "uncertainty_avoidance": 64,
+      "long_term_orientation": 32,
+      "indulgence": 45
+    },
+    "source": "Hofstede Insights 公开文化维度数据(geerthofstede.com)，量表分0-100",
+    "usage": "作为语言风格/消费习惯条目置信度的外部佐证，非唯一依据；与真实广告案例、母语者校准互补"
+  }
 }

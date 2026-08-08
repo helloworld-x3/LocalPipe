@@ -266,6 +266,13 @@ def profile_context(profile):
     lines = []
     for e in profile["entries"]:
         lines.append(f"[{e['id']}] ({e['type']}, 置信度{e['confidence']}) {e['content']}")
+    # 2026-07-30 增强：注入 Hofstede 文化维度作为风格佐证（画像中已有的结构化数据）
+    dims = profile.get("cultural_dimensions", {})
+    dim_values = dims.get("dimensions") or {}
+    if dim_values:
+        dim_text = "、".join(f"{k}={v}" for k, v in dim_values.items())
+        lines.append(f"[hofstede] (文化维度, 外部量表佐证) {dim_text}——重创作时让文案风格与这些维度倾向一致")
+
     return "\n".join(lines)
 
 
@@ -361,6 +368,11 @@ def fidelity_check(localized_copy, original_elements, brand=None):
 每条术语在 checks 中加一项，kind 填 "protected_term"。
 """
     prompt = f"""你是质检员。以下是一条本地化后的营销文案，和它源创意的要素表。逐项检查源要素是否在本地化文案中得到保留（允许文化形式变化，但营销功能必须还在）。
+
+【文化对齐要求】（2026-07-30 增强，依据 Hofstede CAT 文化对齐评估思路）
+除要素保真外，额外核对：本地化文案是否符合目标市场的文化风格（语言含蓄度/直白度、幽默方式、权威叙事 vs 平权叙事、价格敏感表达）。
+如发现文化风格与目标市场明显不符（例如对高不确定性规避市场使用夸张绝对化承诺、对低语境市场使用高语境含蓄暗示），
+在 checks 中追加一项 kind=cultural_alignment、recovered=false 的检查，并注明是文化对齐问题而非要素丢失。
 {term_section}
 【本地化文案】
 {sanitize_user_input(localized_copy)}
