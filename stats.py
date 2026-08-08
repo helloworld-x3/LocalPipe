@@ -42,21 +42,32 @@ def main():
     if pipeline_runs:
         passed = sum(1 for r in pipeline_runs if r.get("final_status") == "pass")
         errored = sum(1 for r in pipeline_runs if r.get("final_status") == "error")
-        avg_total = sum(
-            r.get("timings", {}).get("total_ms", 0) for r in pipeline_runs
-        ) / len(pipeline_runs)
 
-        print(f"管线运行: {len(pipeline_runs)} 次")
+        # 区分缓存命中(总耗时 <100ms)与真实 LLM 调用，避免缓存把耗时均值拉成假数字
+        def _total(r):
+            return r.get("timings", {}).get("total_ms", 0) or 0
+
+        real_runs = [r for r in pipeline_runs if _total(r) >= 100]
+        cached_runs = [r for r in pipeline_runs if _total(r) < 100]
+
+        print(f"管线运行: {len(pipeline_runs)} 次（真实 LLM 调用 {len(real_runs)}，缓存命中 {len(cached_runs)}）")
         print(f"  通过: {passed}  需审核: {len(pipeline_runs) - passed - errored}  错误: {errored}")
         print(f"  成功率: {passed / len(pipeline_runs):.0%}")
-        print(f"  平均耗时: {avg_total:.0f}ms")
 
-        # 各层平均耗时
+        if real_runs:
+            ts = sorted(_total(r) for r in real_runs)
+            avg = sum(ts) / len(ts)
+            med = ts[len(ts) // 2]
+            print(f"  真实调用平均耗时: {avg:.0f}ms  中位: {med:.0f}ms  最快: {min(ts):.0f}ms  最慢: {max(ts):.0f}ms")
+            real_passed = sum(1 for r in real_runs if r.get("final_status") == "pass")
+            print(f"  真实调用通过率: {real_passed / len(real_runs):.0%} ({real_passed}/{len(real_runs)})")
+
+        # 各层平均耗时（仅真实调用）
         layers = ["deconstruct_ms", "recreate_ms", "fidelity_ms", "taboo_ms"]
         labels = ["解构", "重创作", "回检", "禁忌"]
-        print(f"\n各层平均耗时:")
+        print(f"\n各层平均耗时（仅真实调用）:")
         for layer, label in zip(layers, labels):
-            vals = [r.get("timings", {}).get(layer, 0) for r in pipeline_runs if r.get("timings", {}).get(layer)]
+            vals = [r.get("timings", {}).get(layer, 0) for r in real_runs if r.get("timings", {}).get(layer)]
             if vals:
                 print(f"  {label}: {sum(vals)/len(vals):.0f}ms")
 

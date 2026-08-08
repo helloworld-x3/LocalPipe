@@ -1,5 +1,6 @@
 .env
-outputs/
+outputs/*
+!outputs/demo_meta_fr_fashion_package.json
 __pycache__/
 *.pyc
 .cache/

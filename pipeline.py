@@ -37,6 +37,23 @@ from model import ModelClient, ModelConfig, sanitize_user_input, Cache, Telemetr
 
 FIDELITY_THRESHOLD = float(os.environ.get("FIDELITY_THRESHOLD", "0.7"))
 MAX_RETRIES = 2
+
+# 保真回检要素权重（加权保真率）：品牌保护词与产品事实最重，情绪/CTA 次之。
+# 漏一个数字事实比少一个情绪词严重得多——用权重而不是简单平均来衡量。
+_KIND_WEIGHTS = {
+    "protected_term": 3,  # 品牌保护词：不可丢
+    "selling_point": 2,   # 核心卖点
+    "emotion_hook": 1,    # 情绪钩子
+    "cta": 1,             # 行动号召
+}
+_NUMERIC_FACT_WEIGHT = 3  # 含数字的产品事实（如"3秒降温15度"）视为关键要素
+
+
+def _kind_weight(kind, element=""):
+    """要素重要性权重：数字事实/品牌词最重（3），核心卖点次之（2），情绪/CTA 为 1。"""
+    if kind == "selling_point" and any(ch.isdigit() for ch in element):
+        return _NUMERIC_FACT_WEIGHT
+    return _KIND_WEIGHTS.get(kind, 1)
 RETRY_BACKOFF = [1, 2, 4]  # _llm_json 退避重试间隔（秒）
 
 _cache = Cache()
@@ -67,6 +84,10 @@ _SCHEMAS = {
     "taboo": {
         "required": ["risk_level", "flags"],
         "types": {"risk_level": str, "flags": list},
+    },
+    "reviews_ai": {
+        "required": ["problem_categories", "feedback_summary", "revision_candidates"],
+        "types": {"problem_categories": list, "feedback_summary": str, "revision_candidates": list},
     },
 }
 
@@ -266,12 +287,17 @@ def profile_context(profile):
     lines = []
     for e in profile["entries"]:
         lines.append(f"[{e['id']}] ({e['type']}, 置信度{e['confidence']}) {e['content']}")
-    # 2026-07-30 增强：注入 Hofstede 文化维度作为风格佐证（画像中已有的结构化数据）
+    # 文化维度只作非条目背景，不能伪装成可追溯的画像 ID。
+    # 否则模型容易把 "hofstede" 写入 used_entries，随后被证据门正确判为无效引用。
     dims = profile.get("cultural_dimensions", {})
     dim_values = dims.get("dimensions") or {}
     if dim_values:
         dim_text = "、".join(f"{k}={v}" for k, v in dim_values.items())
-        lines.append(f"[hofstede] (文化维度, 外部量表佐证) {dim_text}——重创作时让文案风格与这些维度倾向一致")
+        usage = str(dims.get("usage", "不得单独推出广告结论")).strip()
+        lines.append(
+            "【文化维度背景（非画像条目，不得写入 used_entries）】"
+            f"{dim_text}；{usage}。只能用上方带正式 ID 的画像条目支撑创作结论。"
+        )
 
     return "\n".join(lines)
 
@@ -393,14 +419,23 @@ recovery_rate = 保留的要素数 / 总要素数（卖点每条算一项，情�
 
 # ========== 第四层：禁忌质检 ==========
 
-def taboo_check(localized_copy, profile):
+def taboo_check(localized_copy, profile, source_text=None):
     market = profile["market"]
     taboos = [e for e in profile["entries"] if e["type"] == "文化禁忌"]
     taboo_text = "\n".join(f"[{e['id']}] {e['content']}" for e in taboos)
+    source_section = ""
+    if source_text:
+        source_section = f"""
+【源文案（中文）—— 必须一并审查】
+{sanitize_user_input(source_text)}
+若源文案存在违反禁忌清单的诉求（功效夸大、身材/外貌承诺、绝对化用语等），
+即使本地化文案已规避，也必须判源文案违规，风险等级升为 medium 或 high，
+flags 中注明对应禁忌条目 ID（清单外风险填 external）。
+"""
 
     prompt = f"""你是{market}市场合规审查员。检查以下文案是否触碰禁忌清单，以及是否有清单外的文化/宗教/广告法风险。
-
-【文案】
+{source_section}
+【本地化文案】
 {sanitize_user_input(localized_copy)}
 
 【禁忌清单】
@@ -417,8 +452,9 @@ def taboo_check(localized_copy, profile):
 # ========== 管线编排 ==========
 
 def compute_recovery_rate(checks):
-    """纯函数：根据 checks 数组计算真实恢复率。
+    """纯函数：简单平均口径的真实恢复率（legacy/测试用）。
 
+    主管线用 _evaluate_fidelity_checks 的加权保真率（品牌词/数字事实权重更高）。
     - checks 为空或非 list → 0.0
     - 单个 check 缺少 recovered 字段 → 按 False
     - recovered 必须严格为 True（布尔），字符串 "false" 等真值无效
@@ -461,10 +497,17 @@ def _build_expected_checks(elements, brand=None):
 
 
 def _evaluate_fidelity_checks(expected, checks):
-    """按 (kind, element) 严格核对 checks，重复或非布尔结果均不通过。"""
+    """按 (kind, element) 严格核对 checks，重复或非布尔结果均不通过。
+
+    文化对齐是独立门：模型在 fidelity 阶段发现文案风格与目标市场文化维度
+    明显不符时，会追加 kind=cultural_alignment 的检查。该检查不参与要素
+    回收率计算，但 recovered 非 True 时整体判定文化对齐失败（打回重做）。
+    """
     check_map = {}
     unexpected = []
     expected_set = set(expected)
+    alignment_checked = False
+    alignment_failed = False
     for check in checks if isinstance(checks, list) else []:
         if not isinstance(check, dict):
             continue
@@ -476,6 +519,16 @@ def _evaluate_fidelity_checks(expected, checks):
                 "element": element,
                 "reason": "invalid_key_type",
             })
+            continue
+        if kind == "cultural_alignment":
+            alignment_checked = True
+            if check.get("recovered") is not True:
+                alignment_failed = True
+                unexpected.append({
+                    "kind": kind,
+                    "element": element,
+                    "reason": "cultural_alignment_failed",
+                })
             continue
         key = (kind, element)
         if key not in expected_set:
@@ -504,13 +557,19 @@ def _evaluate_fidelity_checks(expected, checks):
             reason = "recovered_not_bool"
         failed.append({"kind": key[0], "element": key[1], "reason": reason})
 
-    rate = len(matched) / len(expected) if expected else 0.0
+    rate_unweighted = len(matched) / len(expected) if expected else 0.0
+    weight_matched = sum(_kind_weight(kind, element) for kind, element in matched)
+    weight_total = sum(_kind_weight(kind, element) for kind, element in expected)
+    rate = weight_matched / weight_total if weight_total else 0.0
     structure_valid = bool(expected) and all(
         item["reason"] == "not_recovered" for item in failed
     )
     return {
         "rate": rate,
+        "rate_unweighted": rate_unweighted,
         "structure_valid": structure_valid,
+        "alignment_checked": alignment_checked,
+        "alignment_failed": alignment_failed,
         "matched": [{"kind": kind, "element": element} for kind, element in matched],
         "failed": failed,
         "unexpected": unexpected,
@@ -566,6 +625,7 @@ def localize(source_text, market_code, brand=None, verbose=True):
     fidelity = None
     verified_recovery_rate = None
     fidelity_structure_valid = False
+    alignment_failed = False
     try:
         for attempt in range(1 + MAX_RETRIES):
             if attempt > 0:
@@ -604,8 +664,12 @@ def localize(source_text, market_code, brand=None, verbose=True):
             rate = evaluation["rate"]
             verified_recovery_rate = rate
             fidelity_structure_valid = evaluation["structure_valid"]
+            alignment_failed = bool(evaluation["alignment_failed"])
             fidelity["recovery_rate"] = rate
+            fidelity["recovery_rate_unweighted"] = evaluation["rate_unweighted"]
             fidelity["_structure_valid"] = fidelity_structure_valid
+            fidelity["_alignment_checked"] = evaluation["alignment_checked"]
+            fidelity["_alignment_failed"] = alignment_failed
             fidelity["_expected"] = [
                 {"kind": kind, "element": element}
                 for kind, element in expected_checks
@@ -619,12 +683,16 @@ def localize(source_text, market_code, brand=None, verbose=True):
                 f"({len(evaluation['matched'])}/{len(expected_checks)} 匹配, 程序重算)"
             )
 
-            if rate >= FIDELITY_THRESHOLD and fidelity_structure_valid:
+            if rate >= FIDELITY_THRESHOLD and fidelity_structure_valid and not alignment_failed:
                 break
             failed_summary = [
                 f"{item['kind']}:{item['element']}({item['reason']})"
                 for item in evaluation["failed"]
             ]
+            if alignment_failed:
+                failed_summary.append(
+                    "cultural_alignment: 文案风格与目标市场文化维度明显不符，需重新对齐文化表达"
+                )
             log(f"  低于阈值 {FIDELITY_THRESHOLD:.0%}，未通过要素: {failed_summary}，打回重做")
             elements["_retry_hint"] = (
                 "上一版这些要素未通过保真检查，重做时必须保留: "
@@ -640,7 +708,7 @@ def localize(source_text, market_code, brand=None, verbose=True):
         try:
             log("[4/4] 禁忌质检...")
             t4 = time.time()
-            taboo = taboo_check(creation["copy"], profile)
+            taboo = taboo_check(creation["copy"], profile, source_text=source_text)
             timings["taboo_ms"] = round((time.time() - t4) * 1000)
             log(f"  风险等级: {taboo.get('risk_level')}")
         except Exception as e:
@@ -661,6 +729,7 @@ def localize(source_text, market_code, brand=None, verbose=True):
             verified_recovery_rate is not None
             and verified_recovery_rate >= FIDELITY_THRESHOLD
             and fidelity_structure_valid
+            and not alignment_failed
             and (taboo or {}).get("risk_level") == "low"
             and _trace_clean
         ):

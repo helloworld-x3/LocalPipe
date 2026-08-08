@@ -17,7 +17,7 @@
 | 本地洞察浅：陌生市场知识依赖少数专家 | 画像条目包含 ID、来源、置信度和时效，使用情况可追溯、可校准 |
 | 生成质量不可控：本地化时可能丢失卖点 | 源要素与 LLM 自检清单交叉核对，失败自动打回重做 |
 
-当前交付的是一个**泰国、日本、美国三市场的文案创译 MVP**。它验证的是可扩展管线架构，不宣称已经覆盖几十个国家或完整图片/视频生产。
+当前交付的是一个**Meta + 服饰 + 法国主样板**，韩国保留为备用样板，泰国、日本、美国作为基础画像回归市场。法国画像把公开证据、冷启动假设和待母语者校准状态分层展示，不把草稿判断包装成企业真实调研。
 
 ## 为什么不是一个长 Prompt
 
@@ -38,10 +38,13 @@ LocalPipe 增加了三个业务闭环：
 | 品牌词与数字卖点保护 | 已实现 | [`pipeline.py`](pipeline.py)、[`examples/brand_context.json`](examples/brand_context.json) |
 | A/B 裸 Prompt 对照与严格配对 | 已实现 | [`baseline.py`](baseline.py)、[`batch.py`](batch.py) |
 | 异常配对剔除记录 | 已实现 | 批量运行输出 `skipped_*.json` |
-| 行为测试 | **32 项通过** | [`test_pipeline.py`](test_pipeline.py)，不调用真实 LLM |
+| 市场洞察/创意策略卡 | **初版规则实现** | [`feishu_connector.py`](feishu_connector.py)、[`strategy.py`](strategy.py)；待企业资料校准 |
+| KreadoAI Prompt/JSON适配 | **原型已实现** | [`kreado_adapter.py`](kreado_adapter.py)；待确认官方输入/接口 |
+| 行为测试 | **71 项通过** | [`test_pipeline.py`](test_pipeline.py)，不调用真实 LLM |
 | 泰国、日本与跨品类产出存档 | 已有样例 | [`examples/`](examples/) |
-| 60 条母语者盲测 | 实验方案已设计，尚未执行 | [`docs/experiment-design.md`](docs/experiment-design.md) |
-| 飞书多维表格协作闭环 | 入围集训阶段计划 | 见“飞书协作闭环” |
+| 法国母语者 A/B 验证 | 3 条广告方案已执行，已收到首份真人反馈；样本不足以得出胜负结论 | [`docs/experiment-design.md`](docs/experiment-design.md) |
+| 飞书多维表格协作闭环 | **API 原型已联调** | 任务读取、结果回写与状态更新已验证；自动触发和妙搭未完成 |
+| 法国 Meta 服饰端到端样板 | **已生成** | [`generate_demo_meta_fr_fashion.py`](generate_demo_meta_fr_fashion.py)、[`outputs/demo_meta_fr_fashion_package.json`](outputs/demo_meta_fr_fashion_package.json)；3 个变体 + C04 风险案例 |
 
 > 说明：自动化测试验证程序规则和异常边界，不等于证明本地化效果优于裸 Prompt。最终效果结论将由母语者盲测给出。
 
@@ -66,7 +69,7 @@ flowchart TD
 
 一次产出只有同时满足以下条件才会获得 `pass`：
 
-1. 程序重算的要素回收率达到阈值（默认 70%）。
+1. 程序重算的**加权保真率**达到阈值（默认 70%）。保真率按要素类型加权：品牌保护词与含数字的产品事实权重最高（3），核心卖点次之（2），情绪钩子与行动号召为 1——漏掉一个数字事实比少一个情绪词严重得多。
 2. 保真检查结构完整：无缺项、重复项、错误类型或非布尔 `recovered`。
 3. 禁忌质检为低风险。
 4. `used_entries` 非空，且引用 ID 真实有效。
@@ -74,15 +77,19 @@ flowchart TD
 
 保真语义仍由 LLM 逐项判断，程序负责验证检查清单的完整性、类型和分数，避免信任模型自报的 `recovery_rate`。
 
-## 一条创意如何被重创作
+## 一条法国服饰创意如何被重创作
 
-源文案包含“手机中暑、开黑、稳如老狗、一杯奶茶钱”等中国网络表达：
+主样板使用一条不涉及体重、身材或绝对化功效的中文服饰 Brief，真实调用 `localize()` 生成 3 个创意变体；每个变体都保留 `fidelity.checks`、`taboo.risk_level`、`profile_trace`、中文回译和 KreadoAI Prompt/JSON。另有 C04 身材羞辱案例用于展示 `needs_review` 分流。
 
-> 这个夏天，别让手机先中暑！CoolClip 散热背夹，3 秒降温 15 度，开黑五连坐照样稳如老狗。学生党福音，一杯奶茶钱，游戏体验直接起飞。
+法国主样板使用以下服饰 Brief：
+
+> 换季穿搭不想反复纠结？雾川舒适针织衫，柔软针织与弹力面料让活动更自在。一件衣服从通勤到周末约会都能自然搭配。请围绕舒适、材质和真实使用场景创作，不讨论身材、体重或外貌评价。
 
 | 市场 | 文化适配 | 质检结果 |
 |---|---|---|
-| 泰国 | “开黑”替换为 RoV 场景；规避“稳如老狗”的冒犯性直译；加入 COD 与当地社媒表达 | [`thailand_demo.json`](examples/thailand_demo.json)：`pass` |
+| 法国 | 舒适、材质、通勤到周末真实场景；避免身材羞辱和未经验证承诺 | [`outputs/demo_meta_fr_fashion_package.json`](outputs/demo_meta_fr_fashion_package.json)：3 个变体 + C04 `needs_review` |
+| 韩国（备用） | 服饰 Meta 样板，保留生成脚本和回归测试 | [`generate_demo_meta_kr_fashion.py`](generate_demo_meta_kr_fashion.py) |
+| 泰国 | “开黑”替换为 RoV 场景；规避“稳如老狗”的冒犯性直译；加入 COD 与当地社媒表达 | [`examples/thailand_demo.json`](examples/thailand_demo.json)：`pass` |
 | 日本 | 价格锚点替换为便利店冰淇淋；使用タイパ、推し活等表达 | [`japan_demo.json`](examples/japan_demo.json)：因夸大断言与版权风险被标记为 `needs_review` |
 | 泰国美妆 | 将“早八人、纯欲天花板、气场两米八”改写为当地早起、便利店与社媒语境 | [`thailand_demo_c02.json`](examples/thailand_demo_c02.json)：首轮低分后触发重做 |
 
@@ -133,16 +140,15 @@ python -m unittest discover -v
 
 项目没有预设“管线一定胜出”，而是提前定义零假设与失败条件：
 
-- 10 条中文文案，覆盖 5 个品类与难/易样本。
-- 泰国、日本、美国 3 个市场。
-- 同一模型生成 A 组裸 Prompt 与 B 组 LocalPipe，共 60 条样本。
-- 每市场邀请 5–10 位母语者进行盲测。
-- 记录地道感、自然程度、购买意愿、评审渠道与文本长度。
+- 法国 Meta 服饰单市场，3 条中文广告 Brief。
+- 同一模型生成裸 Prompt 与 LocalPipe 两组，严格 X/Y 盲测配对。
+- 2 条主质量样本与 1 条安全案例分开统计。
+- 记录本地原创感、自然程度、广告吸引力、发布可用性和问题原因。
 - 若两组无明显差异，分析画像、Prompt 或规则库问题；复测仍无差异则调整路线。
 
 完整假设、判定标准、效度威胁和执行排期见 [`docs/experiment-design.md`](docs/experiment-design.md)。
 
-## 飞书协作闭环（入围集训计划）
+## 飞书协作闭环
 
 LocalPipe 负责创译与质量控制，飞书负责跨市场协作和反馈沉淀：
 
@@ -156,13 +162,14 @@ LocalPipe 负责创译与质量控制，飞书负责跨市场协作和反馈沉�
 → 看板展示进度、质量、跳过率与失败原因
 ```
 
-飞书不是单纯的结果展示页，而是连接品牌方、创意团队、市场审核人与文化知识库的协作中枢。该部分属于入围集训阶段计划，当前仓库尚未将其标记为已完成。
+飞书不是单纯的结果展示页，而是连接品牌方、创意团队、市场审核人与文化知识库的协作中枢。当前已经完成单任务 API 原型联调：读取“待生成”任务、调用 LocalPipe、回写本地化结果与策略包，并将状态更新为“待审核”。连接器仍需手动运行，尚未接入自动触发、妙搭或 KreadoAI 正式 API。
 
 ## 设计边界
 
 - **当前是文案创译 MVP**：优先解决营销创意中最依赖文化判断的上游决策层；图片、视频、配音可消费其结构化结果继续生成。
-- **当前验证三个市场**：画像 Schema 和模型接口支持扩展，但不把三国原型包装成全球覆盖。
-- **画像需要人工校准**：日美画像属于冷启动版本，正式批量生产前必须由母语者审核。
+- **当前主验证一个法国样板**：Meta + 服饰 + 法国；韩国为备用，其他市场用于架构回归。法国画像仍需法语母语者校准。
+- **底层 LLM 可替换**：模型决定生成能力上限；结构化流程、市场画像、证据追溯和验证机制决定产出能否稳定进入业务。
+- **画像需要人工校准**：法国、韩国及其他市场的冷启动条目正式批量生产前都必须由母语者或业务审核。
 - **AI + 人工终审**：禁忌质检用于筛查与分流，不替代当地法律、平台规则和品牌终审。
 
 ## 关键文件
@@ -172,8 +179,16 @@ pipeline.py                 四层管线、画像加载、保真与禁忌质检
 model.py                    OpenAI 兼容模型层、缓存、限流、遥测
 batch.py                    多创意 × 多市场生成与 A/B 盲测文件
 baseline.py                 裸 Prompt 对照组
-test_pipeline.py            32 项离线行为测试
-profiles/                   泰国、日本、美国文化画像 v0.1
+test_pipeline.py            71 项离线行为测试
+strategy.py                 市场/平台创意策略卡规则骨架
+kreado_adapter.py           KreadoAI Prompt 与结构化 JSON 适配原型
+feishu_connector.py         飞书任务读取、结果回写与状态更新
+quality_framework.py        MQM-inspired 质量分类与发布决策
+language_assets.py          品牌名、保护术语与禁用词资产审计
+creative_matrix.py          DCO-inspired 三路线创意矩阵
+experiment_metrics.py       母语者盲测揭盲与小样本统计
+transcreation_delivery.py   专业创译交付包与组合发布决策
+profiles/                   泰国、日本、美国、韩国与法国画像；法国 v0.2 含证据分层
 examples/                   品牌上下文、源文案与产出存档
 docs/experiment-design.md   A/B 母语者盲测方案
 docs/research-review.md     行业、竞品、开源项目与学术调研
@@ -194,10 +209,15 @@ SECURITY.md                 安全审计与能力边界
 - [x] 文化画像元数据化、过期剔除与引用追溯
 - [x] 品牌术语锁定与保真自动打回
 - [x] A/B 严格配对、混排、揭盲和跳过记录
-- [x] 泰国、日本、美国画像 v0.1
-- [x] 32 项离线行为测试
-- [ ] 入围后接入飞书多维表格协作闭环
-- [ ] 执行 60 条母语者盲测并回灌评分
+- [x] 泰国、日本、美国画像 v0.1；韩国备用样板；法国主样板 v0.2
+- [x] 71 项离线行为测试
+- [x] MQM-inspired 质量报告、语言资产、DCO 创意矩阵与专业创译交付包
+- [x] 市场洞察与创意策略卡原型
+- [x] KreadoAI Prompt/JSON适配原型
+- [x] 飞书多维表格单任务 API 原型联调
+- [ ] 飞书自动触发、妙搭界面和正式部署
+- [ ] KreadoAI 正式 API 联调
+- [ ] 收齐法国母语者反馈、揭盲统计并回灌评分
 - [ ] 基于母语者反馈校准画像与规则库
 - [ ] 扩展图片、视频脚本和模型路由
 
@@ -207,4 +227,3 @@ Hello World（x³）
 
 - 乔唯一：技术与管线
 - 唐启程：跨境电商业务与海外盲测渠道
-- 孙文洁：文化画像与评分标准

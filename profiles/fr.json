@@ -1,0 +1,165 @@
+{
+  "market": "法国",
+  "market_code": "fr",
+  "language": "法语",
+  "version": "v0.2",
+  "updated": "2026-08-08",
+  "note": "法国 Meta 服饰样板的研究草稿：公开来源、冷启动假设与待母语者校准条目分层管理；不等同于企业真实调研结论。",
+  "cultural_dimensions": {
+    "framework": "Hofstede 6维文化量表",
+    "dimensions": {
+      "power_distance": 68,
+      "individualism": 71,
+      "masculinity": 43,
+      "uncertainty_avoidance": 86,
+      "long_term_orientation": 63,
+      "indulgence": 48
+    },
+    "source": "仅作为外部背景佐证，不替代法国广告样本或母语者判断。",
+    "usage": "不得单独推出广告结论；需与条目证据和人工校准一起使用。"
+  },
+  "entries": [
+    {
+      "id": "fr-001",
+      "type": "语言风格",
+      "content": "面向未明确年龄和关系的法国大众受众，法语广告先使用 vous；只有受众、品牌调性和渠道明确偏年轻亲密时，才考虑 tu。整条文案必须保持称谓一致。",
+      "confidence": "中",
+      "expires": "2027-01-01",
+      "source": "LLM冷启动假设，待法语母语者校准",
+      "evidence_level": "C",
+      "validation_status": "待法语母语者校准",
+      "unverified_claims": ["具体品牌和年龄边界需要母语者与真实广告样本确认"],
+      "evidence": []
+    },
+    {
+      "id": "fr-002",
+      "type": "文化禁忌",
+      "content": "法国广告文案需要进行真实性、清晰度和尊重人格的人工复核；避免把人物物化、羞辱身体或制造歧视性比较。涉及价格、效果、环保和比较性表述时，必须在投放前补齐可核验证据，不能把规则草稿当法律意见。",
+      "confidence": "高",
+      "expires": "2027-01-01",
+      "source": "ARPP《Image et respect de la personne》公开建议；法律适用仍需专业复核",
+      "evidence_level": "A",
+      "validation_status": "公开来源已核对，待法务/母语者结合业务校准",
+      "unverified_claims": ["具体罚款、法规适用范围和品类限制未在本画像中展开"],
+      "evidence": [
+        {
+          "publisher": "ARPP",
+          "title": "Recommandation Image et respect de la personne",
+          "url": "https://www.arpp.org/nous-consulter/regles/regles-de-deontologie/image-et-respect-de-la-personne/",
+          "published_at": "2016-06-01",
+          "retrieved_at": "2026-08-08",
+          "quote": "La publicité ne doit pas ... propager une image de la personne humaine portant atteinte à sa dignité et à la décence.",
+          "evidence_level": "A",
+          "scope": "法国广告自律；人物尊严、去物化、反歧视"
+        }
+      ]
+    },
+    {
+      "id": "fr-003",
+      "type": "语言风格",
+      "content": "服饰广告优先用具体材质、穿着动作和真实场景来说明价值，少用无依据的夸张承诺和持续催促。是否采用双关、俏皮或 tu 语气，必须由母语者结合品牌和受众确认。",
+      "confidence": "中",
+      "expires": "2026-12-31",
+      "source": "LLM冷启动假设，待法语母语者校准",
+      "evidence_level": "C",
+      "validation_status": "待法语母语者校准",
+      "unverified_claims": ["说服式与促销式的偏好差异需要真实 Meta 样本验证"],
+      "evidence": []
+    },
+    {
+      "id": "fr-004",
+      "type": "语言风格",
+      "content": "中文服饰 Brief 不宜逐句直译；法语版本可围绕同一卖点重排句式和节奏，优先保证自然度、可读性与版面长度。transcreation 作为工作方法假设，需通过母语者盲测确认。",
+      "confidence": "中",
+      "expires": "2026-12-31",
+      "source": "LLM冷启动假设，待法语母语者校准",
+      "evidence_level": "C",
+      "validation_status": "待法语母语者校准",
+      "unverified_claims": ["法语相对中文的版面膨胀比例未做本项目测量"],
+      "evidence": []
+    },
+    {
+      "id": "fr-005",
+      "type": "审美偏好",
+      "content": "法国服饰样板先测试克制、留白和材质细节的视觉方向，同时保留真人穿着和真实评价，避免过度精修或喧闹促销构图。该方向是创意假设，不是法国消费者的普遍事实。",
+      "confidence": "中",
+      "expires": "2026-12-31",
+      "source": "LLM冷启动创意假设，待法国服饰广告样本与母语者校准",
+      "evidence_level": "C",
+      "validation_status": "待法国服饰样本校准",
+      "unverified_claims": ["精致极简与真实性对服饰 Meta 素材的相对效果未验证"],
+      "evidence": []
+    },
+    {
+      "id": "fr-006",
+      "type": "消费习惯",
+      "content": "服饰样板优先把价值表达落到面料、活动自由度、搭配场景和售后信息，而不是只用低价或身材焦虑促成购买；是否突出伦理、隐私或本地价格锚点，待业务样本确认。",
+      "confidence": "中",
+      "expires": "2026-12-31",
+      "source": "LLM冷启动创意假设，待企业和法国受众校准",
+      "evidence_level": "C",
+      "validation_status": "待企业/母语者校准",
+      "unverified_claims": ["价值敏感、退货和隐私偏好的比例没有在本项目中核验"],
+      "evidence": []
+    },
+    {
+      "id": "fr-007",
+      "type": "消费习惯",
+      "content": "促销节点可以作为服饰创意的一个变体，但不要预设消费者一定等待大促；具体 Soldes、黑五和圣诞节点、折扣规则及库存节奏必须在投放前由运营确认。",
+      "confidence": "低",
+      "expires": "2026-12-31",
+      "source": "LLM冷启动假设，待法国运营资料核验",
+      "evidence_level": "C",
+      "validation_status": "待运营确认",
+      "unverified_claims": ["原草稿中的82%数字已移除，未找到可直接复核的原始调研页面"],
+      "evidence": []
+    },
+    {
+      "id": "fr-008",
+      "type": "平台特点",
+      "content": "本项目主样板只把 Meta 作为素材测试平台；电商平台份额、跨境网站信任和服装退货率不作为固定规则写入策略，除非补到具体报告和适用品类。",
+      "confidence": "低",
+      "expires": "2026-12-31",
+      "source": "研究边界说明；原草稿平台份额与退货率未纳入已核验证据",
+      "evidence_level": "C",
+      "validation_status": "待具体报告核验",
+      "unverified_claims": ["Amazon.fr/Cdiscount/Fnac Darty 份额、外国网站拒购比例、服饰退货率"],
+      "evidence": []
+    },
+    {
+      "id": "fr-009",
+      "type": "市场趋势",
+      "content": "FEVAD 2025《Chiffres clés du e-commerce》页面显示：2024年法国电商交易额为1753亿欧元、交易笔数约26亿笔，约4160万法国人至少进行过一次网购。这只能作为法国电商环境背景，不能直接推出服饰品类或 Meta 广告效果结论。",
+      "confidence": "中",
+      "expires": "2026-12-31",
+      "source": "FEVAD 2025《Chiffres clés du e-commerce》公开页面；服饰与 Meta 适用性仍待核验",
+      "evidence_level": "A",
+      "validation_status": "公开行业背景已核对，服饰/Meta 适用性待企业样本校准",
+      "unverified_claims": ["不能据此推出服饰品类规模、平台份额、退货率或投放效果"],
+      "evidence": [
+        {
+          "publisher": "FEVAD",
+          "title": "La FEVAD dévoile l’édition 2025 des « Chiffres clés du e-commerce »",
+          "url": "https://www.fevad.com/edition-2025-des-chiffres-cles-du-e-commerce/",
+          "published_at": "2025-06-01",
+          "retrieved_at": "2026-08-08",
+          "quote": "En 2024, l’e-commerce poursuit sa croissance : 175,3 milliards d’euros, 2,6 milliards de transactions ; 41,6 millions de Français ont effectué au moins un achat en ligne.",
+          "evidence_level": "A",
+          "scope": "法国整体电商环境；不等于服饰品类或 Meta 广告效果"
+        }
+      ]
+    },
+    {
+      "id": "fr-010",
+      "type": "流行元素",
+      "content": "法语社媒梗变化快，不在画像中固化；需要实时热点或母语者提供候选表达，并为每个梗标注短有效期。当前只用于提醒策略层不要擅自生成过期网络用语。",
+      "confidence": "低",
+      "expires": "2026-09-17",
+      "source": "LLM冷启动假设",
+      "evidence_level": "C",
+      "validation_status": "待母语者或实时热点源校准",
+      "unverified_claims": ["梗的周级迭代速度没有进行统计验证"],
+      "evidence": []
+    }
+  ]
+}
