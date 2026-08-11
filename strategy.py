@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from profile_insights import load_profile_summary
+from strategy_compiler import compile_execution_directives, compact_text
 
 
 PLATFORM_RULES = {
@@ -51,7 +52,20 @@ def build_strategy(brief: Dict[str, Any]) -> Dict[str, Any]:
         "format": "短句、单一卖点、明确行动号召",
     })
     primary = str(selling_points[0])
-    scene = str(profile_summary.get("scene", "")).strip() or "真实使用场景"
+    directives, directive_trace = compile_execution_directives(
+        profile_summary,
+        platform_fallback=platform_rule["format"],
+    )
+    scene = directives["scene"]
+    requested_visual = str(brief.get("visual_direction") or "").strip()
+    if "基于画像条目" in requested_visual or "画像条目" in requested_visual:
+        requested_visual = ""
+    visual_direction = compact_text(requested_visual or directives["visual"], max_chars=120) or directives["visual"]
+    directives = {
+        **directives,
+        "hook": platform_rule["hook"],
+        "visual": visual_direction,
+    }
     angles: List[str] = [
         f"结果先行：用{primary}配合“{platform_rule['hook']}”建立第一印象",
         f"场景证明：根据画像证据，在{scene}中展示{primary}的实际价值",
@@ -68,12 +82,15 @@ def build_strategy(brief: Dict[str, Any]) -> Dict[str, Any]:
         "hook": platform_rule["hook"],
         "format_direction": platform_rule["format"],
         "scene_direction": scene,
-        "tone_direction": str(profile_summary.get("tone", "")).strip(),
+        "tone_direction": directives["tone"],
         "creative_angles": angles,
         "cta": cta,
         "copy": str(brief.get("copy", "")).strip(),
-        "visual_direction": str(brief.get("visual_direction", "")).strip() or scene,
-        "risk_notes": str(profile_summary.get("risk_notes", "")).strip(),
+        "visual_direction": visual_direction,
+        "risk_notes": directives["avoid"][0],
+        "profile_version": profile_summary.get("profile_version", ""),
+        "execution_directives": directives,
+        "directive_trace": directive_trace,
         "evidence_ids": list(profile_summary.get("evidence_ids") or []),
         "evidence": list(profile_summary.get("evidence") or []),
         "risk_evidence_ids": list(profile_summary.get("risk_evidence_ids") or []),

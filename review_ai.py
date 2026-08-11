@@ -15,6 +15,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional
 
 from pipeline import _llm_json, load_profile, profile_context
+from profile_history import ProfileHistory
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -167,6 +168,7 @@ def apply_revisions_to_profile(
     market_code: str,
     candidates: List[Dict[str, Any]],
     profile_path: Optional[str] = None,
+    history_dir: Optional[str] = None,
 ) -> str:
     """把已采纳候选原地原子回灌进画像，返回新版本号。
 
@@ -180,6 +182,8 @@ def apply_revisions_to_profile(
 
     with open(path, encoding="utf-8") as f:
         profile = json.load(f)
+
+    before_profile = json.loads(json.dumps(profile, ensure_ascii=False))
 
     entries = profile.get("entries", [])
     if not isinstance(entries, list):
@@ -230,8 +234,32 @@ def apply_revisions_to_profile(
     if not all(isinstance(e, dict) and e.get("id") for e in profile["entries"]):
         raise ValueError("回灌产物 entries 含缺 id 项，放弃落盘")
 
+    history = ProfileHistory(history_dir or os.path.join(os.path.dirname(path), "history"))
+    revision_record_ids = [c.get("revision_record_id", "") for c in candidates]
+    review_record_ids = []
+    for candidate in candidates:
+        raw_ids = candidate.get("review_record_ids") or []
+        if isinstance(raw_ids, str):
+            raw_ids = [item.strip() for item in raw_ids.split(",")]
+        review_record_ids.extend(raw_ids)
+    snapshot = history.snapshot_before_update(
+        before_profile,
+        market_code=market_code,
+        profile_path=path,
+        source="飞书审核反馈归纳(人工采纳候选)",
+        review_record_ids=review_record_ids,
+    )
+
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(raw)
     os.replace(tmp, path)
+    history.record_update(
+        snapshot,
+        before_profile,
+        profile,
+        source="飞书审核反馈归纳(人工采纳候选)",
+        review_record_ids=review_record_ids,
+        revision_record_ids=revision_record_ids,
+    )
     return profile["version"]

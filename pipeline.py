@@ -351,11 +351,67 @@ def brand_rules_text(brand):
 
 # ========== 第二层：画像重创作（带引用追溯） ==========
 
+def _build_creative_routes(elements, profile):
+    """Build stable route contracts from source elements and citable profile entries."""
+    positive_entries = [
+        entry for entry in profile.get("entries", [])
+        if isinstance(entry, dict) and entry.get("type") != "文化禁忌" and entry.get("id")
+    ]
+    evidence_ids = [entry["id"] for entry in positive_entries]
+    selling_points = elements.get("selling_points", []) if isinstance(elements, dict) else []
+    primary_selling_point = selling_points[0] if selling_points else ""
+    emotion_hook = elements.get("emotion_hook", "") if isinstance(elements, dict) else ""
+
+    shared = {
+        "evidence_ids": evidence_ids,
+        "constraints": [
+            "保留全部源卖点、CTA 和品牌保护词",
+            "不得新增源 Brief 或画像条目无法支持的产品事实",
+            "只能引用本路线 evidence_ids 中的非禁忌画像条目",
+        ],
+    }
+    return [
+        {
+            **shared,
+            "route_id": "product_proof",
+            "objective": "优先用具体、可核验的产品证据组织文案，再承接情绪表达",
+            "focus": primary_selling_point,
+        },
+        {
+            **shared,
+            "route_id": "scene_fit",
+            "objective": "使用画像支持的真实使用场景组织卖点，不虚构市场事实",
+            "focus": emotion_hook,
+        },
+        {
+            **shared,
+            "route_id": "brand_emotion",
+            "objective": "保留产品事实，以源情绪钩子和品牌语气重构开场",
+            "focus": emotion_hook,
+        },
+    ]
+
+
+def _creative_route_text(route):
+    if not isinstance(route, dict):
+        return ""
+    return (
+        "\n【本轮创意路线】\n"
+        f"{json.dumps(route, ensure_ascii=False)}\n"
+        "路线只决定表达重心，不得覆盖保真、证据引用和禁忌规则。\n"
+    )
+
+
 def recreate(elements, profile, brand=None):
     market = profile["market"]
     language = profile["language"]
     ctx = profile_context(profile)
     brand_text = brand_rules_text(brand)
+    route = elements.get("_creative_route") if isinstance(elements, dict) else None
+    source_elements = {
+        key: value for key, value in elements.items() if key != "_creative_route"
+    }
+    route_text = _creative_route_text(route)
 
     prompt = f"""你是{market}本地资深广告创意人。基于创意要素和{market}文化画像，用{language}重新创作一版营销文案。
 
@@ -367,8 +423,9 @@ def recreate(elements, profile, brand=None):
 3. 主动运用画像中的条目，并在 used_entries 中列出实际用到的条目ID。注意：只能引用 type 非"文化禁忌"的条目，禁忌条目应当规避而非引用
 4. 严格避开画像中的文化禁忌
 {brand_text}
+{route_text}
 【创意要素】
-{json.dumps(elements, ensure_ascii=False)}
+{json.dumps(source_elements, ensure_ascii=False)}
 
 【{market}文化画像】
 {ctx}
@@ -576,6 +633,221 @@ def _evaluate_fidelity_checks(expected, checks):
     }
 
 
+def _trace_profile_entries(creation, profile):
+    all_entry_ids = {entry["id"] for entry in profile["entries"]}
+    taboo_ids = {
+        entry["id"] for entry in profile["entries"] if entry["type"] == "文化禁忌"
+    }
+    raw_used = creation.get("used_entries", [])
+    used = list(dict.fromkeys(raw_used)) if isinstance(raw_used, list) else []
+    creation["used_entries"] = used
+    trace = {
+        "valid_ids": [uid for uid in used if uid in all_entry_ids and uid not in taboo_ids],
+        "invalid_ids": [uid for uid in used if uid not in all_entry_ids],
+        "taboo_ids": [uid for uid in used if uid in taboo_ids],
+        "empty_reference": len(used) == 0,
+    }
+    creation["profile_trace"] = trace
+    return trace
+
+
+def _candidate_status(creation, fidelity, taboo, threshold):
+    if not creation:
+        return "error"
+    if not fidelity:
+        return "needs_review"
+    trace = creation.get("profile_trace", {})
+    trace_clean = (
+        not trace.get("invalid_ids")
+        and not trace.get("taboo_ids")
+        and not trace.get("empty_reference")
+    )
+    passed = (
+        fidelity.get("recovery_rate", 0.0) >= threshold
+        and fidelity.get("structure_valid") is True
+        and fidelity.get("_alignment_failed") is not True
+        and (taboo or {}).get("risk_level") == "low"
+        and trace_clean
+    )
+    return "pass" if passed else "needs_review"
+
+
+def _evaluate_route_candidate(source_text, elements, profile, brand, route, log):
+    """Run layers 2-4 for one route without mutating the shared decomposition."""
+    route_id = route["route_id"]
+    routed_elements = dict(elements)
+    routed_elements["_creative_route"] = route
+    creation = None
+    fidelity = None
+    taboo = None
+    errors = []
+    timings = {}
+    fidelity_retries = 0
+
+    try:
+        for attempt in range(1 + MAX_RETRIES):
+            if attempt:
+                fidelity_retries += 1
+            log(
+                f"[2/4:{route_id}] 本地化重创作"
+                f"{'（重试 ' + str(attempt) + '）' if attempt else ''}..."
+            )
+            started = time.time()
+            creation = recreate(routed_elements, profile, brand)
+            timings["recreate_ms"] = timings.get("recreate_ms", 0) + round(
+                (time.time() - started) * 1000
+            )
+            trace = _trace_profile_entries(creation, profile)
+            if trace["invalid_ids"]:
+                log(f"  [{route_id}] used_entries 含无效ID: {trace['invalid_ids']}")
+            if trace["taboo_ids"]:
+                log(f"  [{route_id}] used_entries 含禁忌条目: {trace['taboo_ids']}")
+
+            log(f"[3/4:{route_id}] 保真回检...")
+            started = time.time()
+            fidelity = fidelity_check(creation["copy"], elements, brand)
+            timings["fidelity_ms"] = timings.get("fidelity_ms", 0) + round(
+                (time.time() - started) * 1000
+            )
+            expected_checks = _build_expected_checks(elements, brand)
+            evaluation = _evaluate_fidelity_checks(
+                expected_checks, fidelity.get("checks", [])
+            )
+            fidelity["recovery_rate"] = evaluation["rate"]
+            fidelity["recovery_rate_unweighted"] = evaluation["rate_unweighted"]
+            fidelity["structure_valid"] = evaluation["structure_valid"]
+            fidelity["_structure_valid"] = evaluation["structure_valid"]
+            fidelity["_alignment_checked"] = evaluation["alignment_checked"]
+            fidelity["_alignment_failed"] = evaluation["alignment_failed"]
+            fidelity["_expected"] = [
+                {"kind": kind, "element": element} for kind, element in expected_checks
+            ]
+            fidelity["_matched"] = evaluation["matched"]
+            fidelity["_failed"] = evaluation["failed"]
+            if evaluation["unexpected"]:
+                fidelity["_unexpected"] = evaluation["unexpected"]
+
+            if (
+                evaluation["rate"] >= FIDELITY_THRESHOLD
+                and evaluation["structure_valid"]
+                and not evaluation["alignment_failed"]
+            ):
+                break
+            failed_summary = [
+                f"{item['kind']}:{item['element']}({item['reason']})"
+                for item in evaluation["failed"]
+            ]
+            if evaluation["alignment_failed"]:
+                failed_summary.append("cultural_alignment: 文化表达未对齐")
+            routed_elements["_retry_hint"] = (
+                "上一版这些要素未通过保真检查，重做时必须保留: "
+                f"{failed_summary}"
+            )
+    except Exception as exc:
+        errors.append(f"recreate/fidelity: {exc}")
+        log(f"  [{route_id}] 重创作/回检失败: {exc}")
+
+    if creation:
+        try:
+            log(f"[4/4:{route_id}] 禁忌质检...")
+            started = time.time()
+            taboo = taboo_check(creation["copy"], profile, source_text=source_text)
+            timings["taboo_ms"] = round((time.time() - started) * 1000)
+        except Exception as exc:
+            errors.append(f"taboo: {exc}")
+            taboo = {"risk_level": "unknown", "flags": [], "_error": str(exc)}
+            log(f"  [{route_id}] 禁忌质检失败: {exc}")
+
+    final_status = _candidate_status(
+        creation, fidelity, taboo, FIDELITY_THRESHOLD
+    )
+    return {
+        "route_id": route_id,
+        "creative_route": route,
+        "available_evidence_ids": list(route.get("evidence_ids", [])),
+        "copy": creation.get("copy", "") if creation else "",
+        "copy_zh": creation.get("copy_zh", "") if creation else "",
+        "adaptation_note": creation.get("adaptation_note", "") if creation else "",
+        "used_entries": creation.get("used_entries", []) if creation else [],
+        "profile_trace": creation.get("profile_trace", {}) if creation else {},
+        "fidelity": fidelity,
+        "taboo": taboo,
+        "final_status": final_status,
+        "fidelity_retries": fidelity_retries,
+        "timings": timings,
+        "errors": errors if errors else None,
+        "error": "; ".join(errors) if errors else None,
+    }
+
+
+def _localize_competitive(source_text, market_code, profile, elements, brand, log, t_start, timings):
+    from candidate_selection import build_selection_decision
+
+    routes = _build_creative_routes(elements, profile)
+    candidates = [
+        _evaluate_route_candidate(source_text, elements, profile, brand, route, log)
+        for route in routes
+    ]
+    decision = build_selection_decision(candidates, FIDELITY_THRESHOLD)
+    winner = decision["selected"]
+    timings["total_ms"] = round((time.time() - t_start) * 1000)
+
+    if winner is None:
+        final_status = "error"
+        winner = {}
+    elif decision["review_policy"] == "block":
+        final_status = "needs_review" if winner.get("copy") else "error"
+    else:
+        final_status = winner.get("final_status", "needs_review")
+
+    rankings = [
+        {
+            "rank": candidate["rank"],
+            "route_id": candidate.get("route_id"),
+            "score": candidate["score"],
+            "eligible": candidate["eligible"],
+            "hard_gate_reasons": candidate["hard_gate_reasons"],
+            "components": candidate["components"],
+        }
+        for candidate in decision["ranked"]
+    ]
+    selection_trace = {
+        "mode": "competitive",
+        "selected_route_id": winner.get("route_id"),
+        "weights": winner.get("weights", {}),
+        "score_margin": decision["uncertainty"]["margin"],
+        "rankings": rankings,
+    }
+    _telemetry.log({
+        "event": "localize",
+        "market": market_code,
+        "selection_mode": "competitive",
+        "selected_route_id": winner.get("route_id"),
+        "review_policy": decision["review_policy"],
+        "final_status": final_status,
+        "timings": timings,
+    })
+    return {
+        "market": profile["market"],
+        "profile_version": profile["version"],
+        "source_text": source_text,
+        "elements": elements if winner.get("copy") else None,
+        "copy": winner.get("copy", ""),
+        "copy_zh": winner.get("copy_zh", ""),
+        "adaptation_note": winner.get("adaptation_note", ""),
+        "used_entries": winner.get("used_entries", []),
+        "profile_trace": winner.get("profile_trace", {}),
+        "fidelity": winner.get("fidelity"),
+        "taboo": winner.get("taboo"),
+        "final_status": final_status,
+        "errors": winner.get("errors"),
+        "candidates": decision["ranked"],
+        "selection_trace": selection_trace,
+        "uncertainty": decision["uncertainty"],
+        "review_policy": decision["review_policy"],
+    }
+
+
 def localize(source_text, market_code, brand=None, verbose=True):
     """完整管线：一条中文创意 → 一个市场的本地化产出（含追溯与质检数据）
     单层失败不崩全链路，返回部分结果 + error 字段。"""
@@ -619,6 +891,11 @@ def localize(source_text, market_code, brand=None, verbose=True):
             "error": f"创意解构失败: {e}",
             "final_status": "error",
         }
+
+    if os.environ.get("LOCALPIPE_SELECTION_MODE", "competitive").strip().lower() != "legacy":
+        return _localize_competitive(
+            source_text, market_code, profile, elements, brand, log, t_start, timings
+        )
 
     # [2+3] 重创作 + 保真回检（带 fidelity 打回循环）
     creation = None

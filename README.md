@@ -25,7 +25,7 @@
 
 LocalPipe 增加了三个业务闭环：
 
-1. **质量闭环**：生成 → 保真检查 → 不达标自动重做。
+1. **质量闭环**：一次解构 → 三路线生成 → 独立保真/禁忌检查 → 硬门控与择优 → 不达标自动重做。
 2. **知识闭环**：画像条目 → 产出引用 → 问题追溯 → 母语者校准。
 3. **实验闭环**：裸 Prompt 对照 → A/B 严格配对 → 母语者盲测 → 评分回灌。
 
@@ -33,14 +33,14 @@ LocalPipe 增加了三个业务闭环：
 
 | 能力 | 状态 | 可核对证据 |
 |---|---|---|
-| 四层创译管线 | 已实现 | [`pipeline.py`](pipeline.py) |
+| 四层创译管线 + 证据约束候选择优 | 已实现 | [`pipeline.py`](pipeline.py)、[`candidate_selection.py`](candidate_selection.py) |
 | 泰/日/美文化画像 v0.1 | 已实现 | [`profiles/`](profiles/) |
 | 品牌词与数字卖点保护 | 已实现 | [`pipeline.py`](pipeline.py)、[`examples/brand_context.json`](examples/brand_context.json) |
 | A/B 裸 Prompt 对照与严格配对 | 已实现 | [`baseline.py`](baseline.py)、[`batch.py`](batch.py) |
 | 异常配对剔除记录 | 已实现 | 批量运行输出 `skipped_*.json` |
 | 市场洞察/创意策略卡 | **初版规则实现** | [`feishu_connector.py`](feishu_connector.py)、[`strategy.py`](strategy.py)；待企业资料校准 |
 | KreadoAI Prompt/JSON适配 | **原型已实现** | [`kreado_adapter.py`](kreado_adapter.py)；待确认官方输入/接口 |
-| 行为测试 | **71 项通过** | [`test_pipeline.py`](test_pipeline.py)，不调用真实 LLM |
+| 行为测试 | **108 项通过** | [`test_pipeline.py`](test_pipeline.py)，不调用真实 LLM |
 | 泰国、日本与跨品类产出存档 | 已有样例 | [`examples/`](examples/) |
 | 法国母语者 A/B 验证 | 3 条广告方案已执行，已收到首份真人反馈；样本不足以得出胜负结论 | [`docs/experiment-design.md`](docs/experiment-design.md) |
 | 飞书多维表格协作闭环 | **API 原型已联调** | 任务读取、结果回写与状态更新已验证；自动触发和妙搭未完成 |
@@ -54,16 +54,25 @@ LocalPipe 增加了三个业务闭环：
 flowchart TD
     A[中国营销创意] --> B[1. 创意解构]
     B --> C[卖点 / 情绪钩子 / 人群 / CTA]
-    C --> D[2. 国别画像 + 品牌规则重创作]
-    D --> E[本地文案 / 中文回译 / used_entries]
-    E --> F[3. 保真交叉核对]
-    F -->|低于阈值或结构异常| D
-    F -->|通过| G[4. 禁忌与合规检查]
-    G --> H{最终状态}
-    H -->|五项条件均满足| I[pass]
-    H -->|需要人工判断| J[needs_review]
-    H -->|关键层失败| K[error]
+    C --> D1[2A. 产品证据路线]
+    C --> D2[2B. 场景适配路线]
+    C --> D3[2C. 品牌情绪路线]
+    D1 --> E[3. 各候选独立保真回检]
+    D2 --> E
+    D3 --> E
+    E -->|低于阈值或结构异常| D1
+    E --> F[4. 各候选禁忌与合规检查]
+    F --> G[硬门控 + 确定性加权评分]
+    G --> H[赢家回填 + 分差不确定性]
+    H --> I{审核策略}
+    I -->|低风险且低不确定性| J[sample]
+    I -->|中高不确定性或中风险| K[mandatory]
+    I -->|无合格候选| L[block]
 ```
+
+三条路线都只能使用源 Brief、品牌规则和可追溯的非禁忌画像条目，不能创造新的市场事实。候选先经过高风险、低保真、结构异常、文化未对齐和错误画像引用等硬门控，再按程序重算的保真率、文化对齐、证据追溯质量、禁忌安全和路线区分度排序。第一、第二名的总分差决定不确定性与审核强度；模型自报分数不参与选择。
+
+默认使用 `LOCALPIPE_SELECTION_MODE=competitive`。需要紧急回退时可设置为 `legacy`，恢复原单路线生成路径；`localize(source_text, market_code, brand=None, verbose=True)` 接口不变。
 
 ### `pass` 的五个条件
 
@@ -109,6 +118,7 @@ pip install -r requirements.txt
 LLM_API_KEY=your-api-key
 LLM_BASE_URL=https://your-provider.com
 LLM_MODEL=your-model-name
+LOCALPIPE_SELECTION_MODE=competitive
 ```
 
 ### 2. 运行
@@ -175,11 +185,12 @@ LocalPipe 负责创译与质量控制，飞书负责跨市场协作和反馈沉�
 ## 关键文件
 
 ```text
-pipeline.py                 四层管线、画像加载、保真与禁忌质检
+pipeline.py                 四层管线、三路线生成编排、画像加载、保真与禁忌质检
+candidate_selection.py      候选硬门控、确定性评分、排序与不确定性审核策略
 model.py                    OpenAI 兼容模型层、缓存、限流、遥测
 batch.py                    多创意 × 多市场生成与 A/B 盲测文件
 baseline.py                 裸 Prompt 对照组
-test_pipeline.py            71 项离线行为测试
+test_pipeline.py            108 项离线行为测试
 strategy.py                 市场/平台创意策略卡规则骨架
 kreado_adapter.py           KreadoAI Prompt 与结构化 JSON 适配原型
 feishu_connector.py         飞书任务读取、结果回写与状态更新
@@ -206,11 +217,12 @@ SECURITY.md                 安全审计与能力边界
 ## 路线图
 
 - [x] 四层文案创译 MVP
+- [x] 三路线生成、候选硬门控、确定性择优与不确定性审核
 - [x] 文化画像元数据化、过期剔除与引用追溯
 - [x] 品牌术语锁定与保真自动打回
 - [x] A/B 严格配对、混排、揭盲和跳过记录
 - [x] 泰国、日本、美国画像 v0.1；韩国备用样板；法国主样板 v0.2
-- [x] 71 项离线行为测试
+- [x] 108 项离线行为测试
 - [x] MQM-inspired 质量报告、语言资产、DCO 创意矩阵与专业创译交付包
 - [x] 市场洞察与创意策略卡原型
 - [x] KreadoAI Prompt/JSON适配原型

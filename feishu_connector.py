@@ -36,7 +36,10 @@ from review_ai import (  # noqa: E402
     normalize_review_category,
     summarize_feedback,
 )
+from run_ledger import append_run_snapshot, build_run_snapshot  # noqa: E402
+from profile_history import ProfileHistory, rollback_profile  # noqa: E402
 from strategy import build_strategy  # noqa: E402
+from task_checkpoints import CheckpointStore  # noqa: E402
 from transcreation_delivery import build_transcreation_delivery  # noqa: E402
 
 load_dotenv()
@@ -220,6 +223,9 @@ class FeishuBitableClient:
     def list_tasks(self) -> List[Dict[str, Any]]:
         return self._records(self.app_token, self.task_table)
 
+    def list_outputs(self) -> List[Dict[str, Any]]:
+        return self._records(self.output_app_token, self.output_table)
+
     def update_task(self, record_id: str, fields: Dict[str, Any]) -> None:
         self.update_record(self.task_table, record_id, fields, self.app_token)
 
@@ -316,9 +322,12 @@ def build_creative_package(task: Dict[str, Any], result: Dict[str, Any]) -> Dict
         "profile_summary": {
             "tone": insight["tone"],
             "scene": insight["scene"],
+            "platform_preference": insight.get("platform_preference", ""),
             "risk_notes": insight["risk_notes"],
+            "profile_version": insight.get("profile_version", ""),
             "evidence_ids": insight["evidence_ids"],
             "evidence": insight["evidence"],
+            "risk_evidence": insight.get("risk_evidence", []),
             "evidence_details": insight.get("evidence_details", []),
             "publisher": insight.get("publisher", "LocalPipe research draft"),
             "evidence_level": insight.get("evidence_level", "C"),
@@ -344,12 +353,20 @@ def build_creative_package(task: Dict[str, Any], result: Dict[str, Any]) -> Dict
         "recommended_use": f"{strategy['platform']} 人工审核候选",
     }
     delivery = build_transcreation_delivery(result, default_route, kreado, language_assets)
+    run_snapshot = build_run_snapshot(
+        task,
+        result,
+        quality_decision=quality_report["release_decision"],
+        strategy=strategy,
+    )
+    delivery["run_snapshot"] = run_snapshot
     return {
         "insight": insight,
         "strategy": strategy,
         "kreado": kreado,
         "language_assets": language_assets,
         "quality_report": quality_report,
+        "run_snapshot": run_snapshot,
         "transcreation_delivery": delivery,
     }
 
@@ -392,33 +409,79 @@ def process_tasks(tasks: Iterable[Dict[str, Any]], runner=localize) -> List[Dict
         result = runner(source, market, brand=_task_brand(task), verbose=False)
         fields = build_output(task, result)
         if result.get("copy") and result.get("elements"):
-            _merge_package_fields(fields, build_creative_package(task, result))
+            package = build_creative_package(task, result)
+            _merge_package_fields(fields, package)
         outputs.append({"task": task, "result": result, "fields": fields})
     return outputs
 
 
-def run_live() -> int:
+def _task_result_status(result: Dict[str, Any]) -> str:
+    return "待审核" if result.get("final_status") != "error" else "异常"
+
+
+def _output_task_id(record: Dict[str, Any]) -> str:
+    return str(_field(record, FIELD_TASK_ID, "") or _field(record, "task_id", "")).strip()
+
+
+def run_live(client: Optional[FeishuBitableClient] = None, checkpoint_store: Optional[CheckpointStore] = None) -> int:
     app_token = os.environ.get("FEISHU_APP_TOKEN")
     task_table = os.environ.get("FEISHU_TASK_TABLE_ID")
     output_table = os.environ.get("FEISHU_OUTPUT_TABLE_ID")
     output_app = os.environ.get("FEISHU_OUTPUT_APP_TOKEN", app_token)
     if not all((app_token, task_table, output_table)):
         raise RuntimeError("缺少飞书表格配置")
-    client = FeishuBitableClient(app_token, task_table, output_table, output_app)
-    tasks = [record for record in client.list_tasks() if _field(record, FIELD_STATUS) == "待生成"]
+    client = client or FeishuBitableClient(app_token, task_table, output_table, output_app)
+    checkpoint_store = checkpoint_store or CheckpointStore()
+    output_records = client.list_outputs()
+    existing_outputs = {
+        task_id: record for record in output_records
+        if (task_id := _output_task_id(record))
+    }
+    tasks = [
+        record for record in client.list_tasks()
+        if str(_field(record, FIELD_STATUS, "")).strip() in ("待生成", "生成中")
+    ]
     for task in tasks:
-        client.update_task(task["record_id"], {FIELD_STATUS: "生成中"})
-        result = localize(
-            str(_field(task, FIELD_SOURCE)).strip(),
-            str(_field(task, FIELD_MARKET)).strip(),
-            brand=_task_brand(task),
-            verbose=False,
-        )
-        fields = build_output(task, result)
-        if result.get("copy") and result.get("elements"):
-            _merge_package_fields(fields, build_creative_package(task, result))
-        client.create_output(fields)
-        client.update_task(task["record_id"], {FIELD_STATUS: "待审核" if result.get("final_status") != "error" else "异常"})
+        task_id = _output_task_id(task)
+        existing = existing_outputs.get(task_id)
+        checkpoint = checkpoint_store.load(task)
+        if existing:
+            if checkpoint and not checkpoint.get("output_written"):
+                checkpoint_store.mark_output_written(task, str(existing.get("record_id", "")))
+            output_status = str(_field(existing, "系统状态", "")).strip().lower()
+            client.update_task(task["record_id"], {FIELD_STATUS: "异常" if output_status == "error" else "待审核"})
+            continue
+
+        if checkpoint and checkpoint.get("output_written"):
+            result = checkpoint.get("result") or {"final_status": "error"}
+            client.update_task(task["record_id"], {FIELD_STATUS: _task_result_status(result)})
+            continue
+
+        if checkpoint:
+            result = checkpoint.get("result") or {"final_status": "error"}
+            fields = checkpoint.get("fields") or build_output(task, result)
+            run_snapshot = checkpoint.get("run_snapshot") or {}
+        else:
+            client.update_task(task["record_id"], {FIELD_STATUS: "生成中"})
+            result = localize(
+                str(_field(task, FIELD_SOURCE)).strip(),
+                str(_field(task, FIELD_MARKET)).strip(),
+                brand=_task_brand(task),
+                verbose=False,
+            )
+            fields = build_output(task, result)
+            run_snapshot = {}
+            if result.get("copy") and result.get("elements"):
+                package = build_creative_package(task, result)
+                _merge_package_fields(fields, package)
+                run_snapshot = package["run_snapshot"]
+            checkpoint = checkpoint_store.save_generated(task, result, fields, run_snapshot=run_snapshot)
+
+        output_record_id = client.create_output(fields)
+        checkpoint_store.mark_output_written(task, output_record_id)
+        if run_snapshot:
+            append_run_snapshot(run_snapshot)
+        client.update_task(task["record_id"], {FIELD_STATUS: _task_result_status(result)})
     print(f"飞书处理完成：{len(tasks)} 条待生成任务")
     return 0
 
@@ -544,6 +607,8 @@ def _revision_row_to_candidate(record: Dict[str, Any]) -> Dict[str, Any]:
         "confidence": str(_field(record, "建议置信度", "")).strip(),
         "expires": str(_field(record, "建议过期时间", "")).strip() or None,
         "reason": str(_field(record, "依据理由", "")).strip(),
+        "revision_record_id": str(_field(record, "revision_record_id", "")).strip() or record.get("record_id", ""),
+        "review_record_ids": [item.strip() for item in str(_field(record, "引用审核记录", "")).split(",") if item.strip()],
     }
 
 
@@ -577,15 +642,30 @@ def apply_revisions(client: FeishuBitableClient, market: Optional[str] = None) -
     return applied
 
 
+def rollback_profile_version(market: str, version: str) -> Dict[str, Any]:
+    """Restore a retained profile snapshot and refresh integrity hashes."""
+    restored = rollback_profile(market, version)
+    gen_profile_hashes()
+    print(f"画像回滚完成：{market} -> {restored.get('version', version)}")
+    return restored
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="飞书 Bitable ↔ LocalPipe 全链路闭环")
     parser.add_argument("--sync-reviews", action="store_true", help="结果表待审核产出 → 写审核表")
     parser.add_argument("--summarize-reviews", action="store_true", help="审核反馈 → LLM 归纳 → 修订候选")
     parser.add_argument("--apply-revisions", action="store_true", help="已采纳候选 → 回灌画像")
+    parser.add_argument("--rollback-profile", default="", help="回滚画像市场版本，例如 fr:v0.2")
     parser.add_argument("--market", default="", help="限定目标市场（小写代码，如 kr）")
     args = parser.parse_args()
-    if not any((args.sync_reviews, args.summarize_reviews, args.apply_revisions)):
+    if not any((args.sync_reviews, args.summarize_reviews, args.apply_revisions, args.rollback_profile)):
         return run_live()
+    if args.rollback_profile:
+        if ":" not in args.rollback_profile:
+            raise SystemExit("--rollback-profile 格式应为 market:version，例如 fr:v0.2")
+        market_code, profile_version = args.rollback_profile.split(":", 1)
+        rollback_profile_version(market_code, profile_version)
+        return 0
     client = _make_client()
     market = args.market or None
     if args.sync_reviews:

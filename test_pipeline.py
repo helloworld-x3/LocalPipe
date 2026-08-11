@@ -15,6 +15,370 @@ from pipeline import (
 )
 
 
+class TestCoreCandidateSelection(unittest.TestCase):
+    """Pure candidate gate, score, ranking and review-policy contracts."""
+
+    @staticmethod
+    def _candidate(
+        route_id="product_proof",
+        fidelity=1.0,
+        taboo="low",
+        valid_ids=None,
+        invalid_ids=None,
+        taboo_ids=None,
+        empty_reference=False,
+        cultural_alignment=True,
+        structure_valid=True,
+        available_evidence_ids=None,
+    ):
+        valid_ids = ["fr-001"] if valid_ids is None else valid_ids
+        invalid_ids = [] if invalid_ids is None else invalid_ids
+        taboo_ids = [] if taboo_ids is None else taboo_ids
+        checks = []
+        if cultural_alignment is not None:
+            checks.append({
+                "kind": "cultural_alignment",
+                "element": "整体文化对齐",
+                "recovered": cultural_alignment,
+            })
+        candidate = {
+            "route_id": route_id,
+            "fidelity": {
+                "recovery_rate": fidelity,
+                "structure_valid": structure_valid,
+                "checks": checks,
+            },
+            "taboo": {"risk_level": taboo, "flags": []},
+            "profile_trace": {
+                "valid_ids": valid_ids,
+                "invalid_ids": invalid_ids,
+                "taboo_ids": taboo_ids,
+                "empty_reference": empty_reference,
+            },
+        }
+        if available_evidence_ids is not None:
+            candidate["available_evidence_ids"] = available_evidence_ids
+        return candidate
+
+    def test_hard_gates_reject_high_taboo_low_fidelity_and_bad_trace(self):
+        from candidate_selection import evaluate_candidate
+
+        cases = [
+            (self._candidate(taboo="high"), "taboo_high"),
+            (self._candidate(fidelity=0.69), "fidelity_below_threshold"),
+            (self._candidate(valid_ids=[]), "profile_trace_empty"),
+            (self._candidate(invalid_ids=["fr-x"]), "profile_trace_invalid"),
+            (self._candidate(cultural_alignment=False), "cultural_alignment_failed"),
+            (self._candidate(cultural_alignment="true"), "cultural_alignment_failed"),
+            (self._candidate(structure_valid=False), "fidelity_structure_invalid"),
+        ]
+        for candidate, reason in cases:
+            with self.subTest(reason=reason):
+                evaluated = evaluate_candidate(candidate)
+                self.assertFalse(evaluated["eligible"])
+                self.assertIn(reason, evaluated["hard_gate_reasons"])
+
+    def test_weighted_score_is_deterministic_and_exposes_components(self):
+        from candidate_selection import evaluate_candidate
+
+        candidate = self._candidate(
+            route_id="brand_emotion",
+            fidelity=0.8,
+            taboo="medium",
+            valid_ids=["fr-001"],
+            available_evidence_ids=["fr-001", "fr-005"],
+        )
+        evaluated = evaluate_candidate(candidate)
+        self.assertTrue(evaluated["eligible"])
+        self.assertEqual(evaluated["weights"], {
+            "verified_fidelity": 0.45,
+            "cultural_alignment": 0.20,
+            "evidence_trace_quality": 0.15,
+            "taboo_safety": 0.15,
+            "route_distinctiveness": 0.05,
+        })
+        self.assertAlmostEqual(evaluated["components"]["verified_fidelity"], 0.8)
+        self.assertAlmostEqual(evaluated["components"]["cultural_alignment"], 1.0)
+        self.assertAlmostEqual(evaluated["components"]["evidence_trace_quality"], 0.5)
+        self.assertAlmostEqual(evaluated["components"]["taboo_safety"], 0.4)
+        self.assertAlmostEqual(evaluated["components"]["route_distinctiveness"], 0.95)
+        self.assertAlmostEqual(evaluated["score"], 0.7425)
+
+    def test_ranking_preserves_input_order_for_exact_ties(self):
+        from candidate_selection import rank_candidates
+
+        candidates = [
+            self._candidate(route_id="first"),
+            self._candidate(route_id="second"),
+            self._candidate(route_id="third"),
+        ]
+        ranked = rank_candidates(candidates)
+        self.assertEqual([item["route_id"] for item in ranked], ["first", "second", "third"])
+        self.assertEqual([item["rank"] for item in ranked], [1, 2, 3])
+
+    def test_uncertainty_margin_thresholds_are_high_medium_and_low(self):
+        from candidate_selection import build_selection_decision
+
+        def decision(delta):
+            return build_selection_decision([
+                self._candidate(route_id="a", fidelity=0.9),
+                self._candidate(route_id="b", fidelity=0.9 - delta),
+            ])
+
+        self.assertEqual(build_selection_decision([self._candidate()])["uncertainty"]["level"], "high")
+        # Only fidelity differs, so score margin is fidelity delta * 0.45.
+        self.assertEqual(decision(0.02)["uncertainty"]["level"], "high")
+        self.assertEqual(decision(0.10)["uncertainty"]["level"], "medium")
+        self.assertEqual(decision(0.20)["uncertainty"]["level"], "low")
+
+    def test_review_policy_is_block_mandatory_or_sample(self):
+        from candidate_selection import build_selection_decision
+
+        blocked = build_selection_decision([self._candidate(taboo="high")])
+        self.assertEqual(blocked["review_policy"], "block")
+
+        mandatory = build_selection_decision([
+            self._candidate(route_id="a", taboo="medium", fidelity=1.0),
+            self._candidate(route_id="b", taboo="low", fidelity=0.70),
+        ])
+        self.assertEqual(mandatory["selected"]["route_id"], "a")
+        self.assertEqual(mandatory["review_policy"], "mandatory")
+
+        sampled = build_selection_decision([
+            self._candidate(route_id="a", fidelity=1.0),
+            self._candidate(route_id="b", fidelity=0.80),
+        ])
+        self.assertEqual(sampled["uncertainty"]["level"], "low")
+        self.assertEqual(sampled["review_policy"], "sample")
+
+
+class TestCreativeRoutes(unittest.TestCase):
+    @staticmethod
+    def _profile():
+        return {
+            "market": "法国",
+            "language": "法语",
+            "entries": [
+                {"id": "fr-proof", "type": "消费偏好", "content": "重视产品材质的具体说明", "confidence": "中"},
+                {"id": "fr-scene", "type": "场景偏好", "content": "适合日常通勤场景", "confidence": "中"},
+                {"id": "fr-taboo", "type": "文化禁忌", "content": "避免身材羞辱", "confidence": "高"},
+            ],
+        }
+
+    @staticmethod
+    def _elements():
+        return {
+            "selling_points": ["柔软针织", "利落剪裁"],
+            "emotion_hook": "从容进入日常节奏",
+            "target_audience": "都市通勤人群",
+            "cta": "了解系列",
+        }
+
+    def test_build_creative_routes_has_stable_ids_and_profile_evidence(self):
+        from pipeline import _build_creative_routes
+
+        routes = _build_creative_routes(self._elements(), self._profile())
+
+        self.assertEqual(
+            [route["route_id"] for route in routes],
+            ["product_proof", "scene_fit", "brand_emotion"],
+        )
+        self.assertEqual(routes[0]["focus"], "柔软针织")
+        self.assertEqual(routes[1]["focus"], "从容进入日常节奏")
+        self.assertEqual(routes[2]["focus"], "从容进入日常节奏")
+        self.assertTrue(all(route["evidence_ids"] == ["fr-proof", "fr-scene"] for route in routes))
+        self.assertTrue(all("fr-taboo" not in route["evidence_ids"] for route in routes))
+
+    def test_recreate_consumes_private_route_hint_without_leaking_it_into_elements(self):
+        from pipeline import recreate
+
+        elements = self._elements()
+        elements["_creative_route"] = {
+            "route_id": "scene_fit",
+            "objective": "使用画像支持的真实使用场景组织卖点",
+            "focus": "从容进入日常节奏",
+            "evidence_ids": ["fr-proof", "fr-scene"],
+        }
+        response = {
+            "copy": "Une maille douce pour le quotidien.",
+            "copy_zh": "适合日常的柔软针织。",
+            "used_entries": ["fr-scene"],
+            "adaptation_note": "以画像支持的通勤场景组织卖点。",
+        }
+        with patch("pipeline._llm_json", return_value=response) as llm:
+            self.assertEqual(recreate(elements, self._profile()), response)
+
+        prompt = llm.call_args.args[0]
+        self.assertIn("【本轮创意路线】", prompt)
+        self.assertIn("scene_fit", prompt)
+        self.assertIn("使用画像支持的真实使用场景组织卖点", prompt)
+        self.assertNotIn('"_creative_route"', prompt)
+
+
+class TestCompetitivePipeline(unittest.TestCase):
+    def test_competitive_mode_runs_three_routes_and_rejects_gated_candidates(self):
+        from pipeline import localize
+
+        profile = {
+            "market": "法国", "market_code": "fr", "version": "v0.2", "language": "法语",
+            "entries": [
+                {"id": "fr-001", "type": "消费偏好", "confidence": "中", "content": "重视材质说明"},
+                {"id": "fr-002", "type": "场景偏好", "confidence": "中", "content": "日常通勤场景"},
+            ],
+            "_expired_ids": [],
+        }
+        elements = {
+            "selling_points": ["柔软针织"], "emotion_hook": "从容日常",
+            "target_audience": "都市成年人", "cta": "了解系列",
+        }
+        route_uses = {
+            "product_proof": ["fr-001"],
+            "scene_fit": ["missing-id"],
+            "brand_emotion": ["fr-002"],
+        }
+        recreate_calls = []
+
+        def fake_recreate(routed_elements, _profile, brand=None):
+            route_id = routed_elements["_creative_route"]["route_id"]
+            recreate_calls.append(route_id)
+            return {
+                "copy": f"copy-{route_id}",
+                "copy_zh": f"回译-{route_id}",
+                "used_entries": route_uses[route_id],
+                "adaptation_note": f"按 {route_id} 重构",
+            }
+
+        fidelity = {
+            "checks": [
+                {"kind": "selling_point", "element": "柔软针织", "recovered": True},
+                {"kind": "emotion_hook", "element": "从容日常", "recovered": True},
+                {"kind": "cta", "element": "了解系列", "recovered": True},
+                {"kind": "cultural_alignment", "element": "整体文化对齐", "recovered": True},
+            ],
+            "recovery_rate": 1.0,
+        }
+
+        def fake_taboo(copy, _profile, source_text=None):
+            risk = "high" if copy == "copy-product_proof" else "low"
+            return {"risk_level": risk, "flags": []}
+
+        with patch.dict(os.environ, {"LOCALPIPE_SELECTION_MODE": "competitive"}), \
+             patch("pipeline.load_profile", return_value=profile), \
+             patch("pipeline.deconstruct", return_value=elements) as deconstruct_mock, \
+             patch("pipeline.recreate", side_effect=fake_recreate), \
+             patch("pipeline.fidelity_check", return_value=fidelity) as fidelity_mock, \
+             patch("pipeline.taboo_check", side_effect=fake_taboo) as taboo_mock, \
+             patch("pipeline._telemetry.log"):
+            result = localize("中文服饰 Brief", "fr", verbose=False)
+
+        deconstruct_mock.assert_called_once_with("中文服饰 Brief")
+        self.assertEqual(recreate_calls, ["product_proof", "scene_fit", "brand_emotion"])
+        self.assertEqual(fidelity_mock.call_count, 3)
+        self.assertEqual(taboo_mock.call_count, 3)
+        self.assertEqual(result["copy"], "copy-brand_emotion")
+        self.assertEqual(result["selection_trace"]["selected_route_id"], "brand_emotion")
+        self.assertEqual(len(result["candidates"]), 3)
+        by_route = {candidate["route_id"]: candidate for candidate in result["candidates"]}
+        self.assertIn("taboo_high", by_route["product_proof"]["hard_gate_reasons"])
+        self.assertIn("profile_trace_invalid", by_route["scene_fit"]["hard_gate_reasons"])
+        self.assertTrue(by_route["brand_emotion"]["eligible"])
+        self.assertEqual(result["uncertainty"]["level"], "high")
+        self.assertEqual(result["review_policy"], "mandatory")
+
+    def test_legacy_mode_keeps_single_generation_path(self):
+        from pipeline import localize
+
+        profile = {
+            "market": "法国", "market_code": "fr", "version": "v0.2", "language": "法语",
+            "entries": [
+                {"id": "fr-001", "type": "消费偏好", "confidence": "中", "content": "重视材质说明"},
+            ],
+            "_expired_ids": [],
+        }
+        elements = {
+            "selling_points": ["柔软针织"], "emotion_hook": "从容日常",
+            "target_audience": "都市成年人", "cta": "了解系列",
+        }
+        fidelity = {
+            "checks": [
+                {"kind": "selling_point", "element": "柔软针织", "recovered": True},
+                {"kind": "emotion_hook", "element": "从容日常", "recovered": True},
+                {"kind": "cta", "element": "了解系列", "recovered": True},
+            ],
+            "recovery_rate": 1.0,
+        }
+
+        def fake_recreate(received, _profile, brand=None):
+            self.assertNotIn("_creative_route", received)
+            return {
+                "copy": "Une maille douce.", "copy_zh": "柔软针织。",
+                "used_entries": ["fr-001"], "adaptation_note": "保留材质卖点。",
+            }
+
+        with patch.dict(os.environ, {"LOCALPIPE_SELECTION_MODE": "legacy"}), \
+             patch("pipeline.load_profile", return_value=profile), \
+             patch("pipeline.deconstruct", return_value=elements), \
+             patch("pipeline.recreate", side_effect=fake_recreate) as recreate_mock, \
+             patch("pipeline.fidelity_check", return_value=fidelity), \
+             patch("pipeline.taboo_check", return_value={"risk_level": "low", "flags": []}), \
+             patch("pipeline._telemetry.log"):
+            result = localize("中文服饰 Brief", "fr", verbose=False)
+
+        recreate_mock.assert_called_once()
+        self.assertEqual(result["copy"], "Une maille douce.")
+        self.assertEqual(result["final_status"], "pass")
+        self.assertNotIn("candidates", result)
+
+    def test_one_route_failure_does_not_abort_remaining_candidates(self):
+        from pipeline import localize
+
+        profile = {
+            "market": "法国", "market_code": "fr", "version": "v0.2", "language": "法语",
+            "entries": [
+                {"id": "fr-001", "type": "消费偏好", "confidence": "中", "content": "重视材质说明"},
+            ],
+            "_expired_ids": [],
+        }
+        elements = {
+            "selling_points": ["柔软针织"], "emotion_hook": "从容日常",
+            "target_audience": "都市成年人", "cta": "了解系列",
+        }
+        seen = []
+
+        def fake_recreate(routed_elements, _profile, brand=None):
+            route_id = routed_elements["_creative_route"]["route_id"]
+            seen.append(route_id)
+            if route_id == "product_proof":
+                raise RuntimeError("route generation failed")
+            return {
+                "copy": f"copy-{route_id}", "copy_zh": f"回译-{route_id}",
+                "used_entries": ["fr-001"], "adaptation_note": "按路线重构",
+            }
+
+        fidelity = {
+            "checks": [
+                {"kind": "selling_point", "element": "柔软针织", "recovered": True},
+                {"kind": "emotion_hook", "element": "从容日常", "recovered": True},
+                {"kind": "cta", "element": "了解系列", "recovered": True},
+            ],
+            "recovery_rate": 1.0,
+        }
+        with patch.dict(os.environ, {"LOCALPIPE_SELECTION_MODE": "competitive"}), \
+             patch("pipeline.load_profile", return_value=profile), \
+             patch("pipeline.deconstruct", return_value=elements), \
+             patch("pipeline.recreate", side_effect=fake_recreate), \
+             patch("pipeline.fidelity_check", return_value=fidelity), \
+             patch("pipeline.taboo_check", return_value={"risk_level": "low", "flags": []}), \
+             patch("pipeline._telemetry.log"):
+            result = localize("中文服饰 Brief", "fr", verbose=False)
+
+        self.assertEqual(seen, ["product_proof", "scene_fit", "brand_emotion"])
+        self.assertEqual(result["selection_trace"]["selected_route_id"], "scene_fit")
+        failed = next(item for item in result["candidates"] if item["route_id"] == "product_proof")
+        self.assertIn("candidate_error", failed["hard_gate_reasons"])
+        self.assertEqual(result["final_status"], "pass")
+
+
 class TestCorePureRules(unittest.TestCase):
     def test_recovery_rate_ignores_model_claim(self):
         self.assertEqual(compute_recovery_rate([
@@ -406,6 +770,334 @@ class TestBusinessLayers(unittest.TestCase):
 
         self.assertEqual(["Brand A", "Brand B", None], [call and call.get("brand_name") for call in calls])
 
+    def test_process_tasks_is_pure_and_does_not_append_run_ledger(self):
+        from feishu_connector import process_tasks
+
+        result = {
+            "copy": "ok", "elements": {"selling_points": ["卖点"], "cta": "购买"},
+            "final_status": "pass", "fidelity": {"recovery_rate": 1.0},
+            "taboo": {"risk_level": "low"}, "used_entries": ["fr-001"],
+            "profile_version": "v0.2", "profile_trace": {"valid_ids": ["fr-001"]},
+        }
+        with patch("feishu_connector.append_run_snapshot") as append:
+            process_tasks(
+                [{"任务ID": "T1", "中文原文": "广告", "目标市场": "fr", "平台": "Meta"}],
+                runner=lambda *args, **kwargs: result,
+            )
+        append.assert_not_called()
+
+    def test_run_live_appends_one_snapshot_for_each_successful_package(self):
+        import feishu_connector
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.updated = []
+                self.created = []
+
+            def list_tasks(self):
+                return [{
+                    "record_id": "rec1",
+                    "fields": {
+                        "任务ID": "T1", "中文原文": "广告", "目标市场": "fr",
+                        "平台": "Meta", "产品品类": "服饰", "状态": "待生成",
+                    },
+                }]
+
+            def list_outputs(self):
+                return []
+
+            def update_task(self, record_id, fields):
+                self.updated.append((record_id, fields))
+
+            def create_output(self, fields):
+                self.created.append(fields)
+                return f"out{len(self.created)}"
+
+        result = {
+            "copy": "Une maille douce.", "copy_zh": "柔软针织。",
+            "elements": {"selling_points": ["柔软针织"], "cta": "了解系列"},
+            "final_status": "pass", "fidelity": {"recovery_rate": 1.0},
+            "taboo": {"risk_level": "low"}, "used_entries": ["fr-001"],
+            "profile_version": "v0.2", "profile_trace": {"valid_ids": ["fr-001"]},
+        }
+        env = {
+            "FEISHU_APP_TOKEN": "app", "FEISHU_TASK_TABLE_ID": "task",
+            "FEISHU_OUTPUT_TABLE_ID": "output",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.dict(os.environ, env, clear=False), \
+             patch.object(feishu_connector, "FeishuBitableClient", FakeClient), \
+             patch.object(feishu_connector, "localize", return_value=result), \
+             patch.object(feishu_connector, "append_run_snapshot") as append:
+            store = __import__("task_checkpoints").CheckpointStore(Path(temp_dir) / "checkpoints.json")
+            self.assertEqual(feishu_connector.run_live(checkpoint_store=store), 0)
+        append.assert_called_once()
+        self.assertEqual(append.call_args.args[0]["task_id"], "T1")
+
+    def test_run_live_recovers_task_left_in_generating(self):
+        import feishu_connector
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.updated = []
+                self.created = []
+
+            def list_tasks(self):
+                return [{
+                    "record_id": "rec1",
+                    "fields": {
+                        "任务ID": "T1", "中文原文": "广告", "目标市场": "fr",
+                        "状态": "生成中",
+                    },
+                }]
+
+            def list_outputs(self):
+                return []
+
+            def update_task(self, record_id, fields):
+                self.updated.append((record_id, fields))
+
+            def create_output(self, fields):
+                self.created.append(fields)
+                return "out1"
+
+        result = {
+            "copy": "Une publicité.", "copy_zh": "广告。",
+            "elements": {"selling_points": ["卖点"], "cta": "购买"},
+            "final_status": "pass", "fidelity": {"recovery_rate": 1.0},
+            "taboo": {"risk_level": "low"}, "used_entries": ["fr-001"],
+            "profile_version": "v0.2", "profile_trace": {"valid_ids": ["fr-001"]},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(feishu_connector, "FeishuBitableClient", FakeClient), \
+             patch.object(feishu_connector, "localize", return_value=result) as localize_mock:
+            self.assertEqual(
+                feishu_connector.run_live(checkpoint_store=__import__("task_checkpoints").CheckpointStore(Path(temp_dir) / "checkpoints.json")),
+                0,
+            )
+        localize_mock.assert_called_once()
+
+    def test_run_live_reuses_generation_checkpoint_without_localize(self):
+        import feishu_connector
+        from task_checkpoints import CheckpointStore
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.updated = []
+                self.created = []
+
+            def list_tasks(self):
+                return [{"record_id": "rec1", "fields": {
+                    "任务ID": "T1", "中文原文": "广告", "目标市场": "fr", "状态": "生成中",
+                }}]
+
+            def list_outputs(self):
+                return []
+
+            def update_task(self, record_id, fields):
+                self.updated.append((record_id, fields))
+
+            def create_output(self, fields):
+                self.created.append(fields)
+                return "out1"
+
+        result = {
+            "copy": "Une publicité.", "copy_zh": "广告。",
+            "elements": {"selling_points": ["卖点"], "cta": "购买"},
+            "final_status": "pass", "fidelity": {"recovery_rate": 1.0},
+            "taboo": {"risk_level": "low"}, "used_entries": ["fr-001"],
+            "profile_version": "v0.2", "profile_trace": {"valid_ids": ["fr-001"]},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CheckpointStore(Path(temp_dir) / "checkpoints.json")
+            task = {"record_id": "rec1", "任务ID": "T1", "中文原文": "广告", "目标市场": "fr", "状态": "生成中"}
+            fields = feishu_connector.build_output(task, result)
+            package = feishu_connector.build_creative_package(task, result)
+            feishu_connector._merge_package_fields(fields, package)
+            store.save_generated(task, result, fields, run_snapshot=package["run_snapshot"])
+            with patch.object(feishu_connector, "FeishuBitableClient", FakeClient), \
+                 patch.object(feishu_connector, "localize", side_effect=AssertionError("localize must not run")), \
+                 patch.object(feishu_connector, "append_run_snapshot") as append:
+                self.assertEqual(feishu_connector.run_live(checkpoint_store=store), 0)
+            self.assertEqual(len(append.call_args_list), 1)
+
+    def test_run_live_does_not_duplicate_when_output_already_exists(self):
+        import feishu_connector
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.updated = []
+                self.created = []
+
+            def list_tasks(self):
+                return [{"record_id": "rec1", "fields": {
+                    "任务ID": "T1", "中文原文": "广告", "目标市场": "fr", "状态": "生成中",
+                }}]
+
+            def list_outputs(self):
+                return [{"record_id": "out1", "fields": {"任务ID": "T1", "系统状态": "待审核"}}]
+
+            def update_task(self, record_id, fields):
+                self.updated.append((record_id, fields))
+
+            def create_output(self, fields):
+                self.created.append(fields)
+                return "unexpected"
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(feishu_connector, "FeishuBitableClient", FakeClient), \
+             patch.object(feishu_connector, "localize", side_effect=AssertionError("localize must not run")):
+            store = __import__("task_checkpoints").CheckpointStore(Path(temp_dir) / "checkpoints.json")
+            self.assertEqual(feishu_connector.run_live(checkpoint_store=store), 0)
+
+    def test_run_live_retry_after_status_update_failure_does_not_duplicate_output(self):
+        import feishu_connector
+        from task_checkpoints import CheckpointStore
+
+        class FakeClient:
+            def __init__(self):
+                self.task_status = "待生成"
+                self.outputs = []
+                self.fail_final_update = True
+
+            def list_tasks(self):
+                return [{"record_id": "rec1", "fields": {
+                    "任务ID": "T1", "中文原文": "广告", "目标市场": "fr", "状态": self.task_status,
+                }}]
+
+            def list_outputs(self):
+                return list(self.outputs)
+
+            def update_task(self, record_id, fields):
+                status = fields["状态"]
+                if status == "待审核" and self.fail_final_update:
+                    self.fail_final_update = False
+                    raise RuntimeError("simulated status update failure")
+                self.task_status = status
+
+            def create_output(self, fields):
+                record_id = f"out{len(self.outputs) + 1}"
+                self.outputs.append({"record_id": record_id, "fields": fields})
+                return record_id
+
+        result = {
+            "copy": "Une publicité.", "copy_zh": "广告。",
+            "elements": {"selling_points": ["卖点"], "cta": "购买"},
+            "final_status": "pass", "fidelity": {"recovery_rate": 1.0},
+            "taboo": {"risk_level": "low"}, "used_entries": ["fr-001"],
+            "profile_version": "v0.2", "profile_trace": {"valid_ids": ["fr-001"]},
+        }
+        client = FakeClient()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CheckpointStore(Path(temp_dir) / "checkpoints.json")
+            with patch.object(feishu_connector, "localize", return_value=result) as localize_mock:
+                with self.assertRaisesRegex(RuntimeError, "status update failure"):
+                    feishu_connector.run_live(client=client, checkpoint_store=store)
+                self.assertEqual(feishu_connector.run_live(client=client, checkpoint_store=store), 0)
+            self.assertEqual(len(client.outputs), 1)
+            localize_mock.assert_called_once()
+            self.assertEqual(client.task_status, "待审核")
+
+    def test_run_live_does_not_duplicate_after_output_written_checkpoint(self):
+        import feishu_connector
+        from task_checkpoints import CheckpointStore
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.created = []
+
+            def list_tasks(self):
+                return [{"record_id": "rec1", "fields": {
+                    "任务ID": "T1", "中文原文": "广告", "目标市场": "fr", "状态": "生成中",
+                }}]
+
+            def list_outputs(self):
+                return []
+
+            def update_task(self, record_id, fields):
+                pass
+
+            def create_output(self, fields):
+                self.created.append(fields)
+                return "unexpected"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CheckpointStore(Path(temp_dir) / "checkpoints.json")
+            task = {"record_id": "rec1", "任务ID": "T1", "中文原文": "广告", "目标市场": "fr", "状态": "生成中"}
+            store.save_generated(task, {"copy": "x", "final_status": "pass"}, {"任务ID": "T1"})
+            store.mark_output_written(task, "out1")
+            with patch.object(feishu_connector, "FeishuBitableClient", FakeClient), \
+                 patch.object(feishu_connector, "localize", side_effect=AssertionError("localize must not run")):
+                self.assertEqual(feishu_connector.run_live(checkpoint_store=store), 0)
+
+    def test_run_live_reprocesses_when_checkpoint_input_changes(self):
+        import feishu_connector
+        from task_checkpoints import CheckpointStore
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.created = []
+
+            def list_tasks(self):
+                return [{"record_id": "rec1", "fields": {
+                    "任务ID": "T1", "中文原文": "新广告", "目标市场": "fr", "状态": "生成中",
+                }}]
+
+            def list_outputs(self):
+                return []
+
+            def update_task(self, record_id, fields):
+                pass
+
+            def create_output(self, fields):
+                self.created.append(fields)
+                return "out1"
+
+        result = {"copy": "new", "elements": {}, "final_status": "pass", "fidelity": {"recovery_rate": 1.0}, "taboo": {"risk_level": "low"}}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CheckpointStore(Path(temp_dir) / "checkpoints.json")
+            old_task = {"record_id": "rec1", "任务ID": "T1", "中文原文": "旧广告", "目标市场": "fr"}
+            store.save_generated(old_task, {"copy": "old"}, {"任务ID": "T1"})
+            with patch.object(feishu_connector, "FeishuBitableClient", FakeClient), \
+                 patch.object(feishu_connector, "localize", return_value=result) as localize_mock:
+                self.assertEqual(feishu_connector.run_live(checkpoint_store=store), 0)
+            localize_mock.assert_called_once()
+
+    def test_task_checkpoint_reuses_result_after_generation_interruption(self):
+        from task_checkpoints import CheckpointStore
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CheckpointStore(Path(temp_dir) / "checkpoints.json")
+            task = {"record_id": "rec1", "任务ID": "T1", "中文原文": "广告", "目标市场": "fr"}
+            result = {"copy": "Une publicité.", "final_status": "pass"}
+            store.save_generated(task, result, {"任务ID": "T1", "本地化文案": "Une publicité."})
+            loaded = store.load(task)
+            self.assertEqual(loaded["result"], result)
+            self.assertFalse(loaded["output_written"])
+
+    def test_task_checkpoint_invalidates_when_source_or_market_changes(self):
+        from task_checkpoints import CheckpointStore
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CheckpointStore(Path(temp_dir) / "checkpoints.json")
+            task = {"record_id": "rec1", "任务ID": "T1", "中文原文": "广告", "目标市场": "fr"}
+            store.save_generated(task, {"copy": "x"}, {})
+            changed = {**task, "中文原文": "新广告"}
+            self.assertIsNone(store.load(changed))
+
+    def test_task_checkpoint_marks_output_written_idempotently(self):
+        from task_checkpoints import CheckpointStore
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CheckpointStore(Path(temp_dir) / "checkpoints.json")
+            task = {"record_id": "rec1", "任务ID": "T1", "中文原文": "广告", "目标市场": "fr"}
+            store.save_generated(task, {"copy": "x"}, {"任务ID": "T1"})
+            store.mark_output_written(task, "out1")
+            store.mark_output_written(task, "out1")
+            loaded = store.load(task)
+            self.assertTrue(loaded["output_written"])
+            self.assertEqual(loaded["output_record_id"], "out1")
+
     def test_task_brand_extracts_name_from_chinese_requirements(self):
         from feishu_connector import _task_brand
 
@@ -441,6 +1133,67 @@ class TestBusinessLayers(unittest.TestCase):
         self.assertEqual(result["risk_notes"], "PROFILE_RISK")
         self.assertEqual(result["evidence_ids"], ["kr-test"])
         self.assertEqual(result["confidence"], 0.61)
+
+    def test_strategy_preserves_profile_version_in_execution_contract(self):
+        from strategy import build_strategy
+
+        result = build_strategy({
+            "market": "fr", "platform": "Meta", "audience": "成年人",
+            "selling_points": ["柔软针织"], "cta": "了解系列",
+            "profile_summary": {
+                "profile_version": "v9.2", "tone": "克制", "scene": "通勤",
+                "risk_notes": "避免夸大", "evidence_ids": ["fr-001"],
+                "risk_evidence_ids": ["fr-002"], "confidence": 0.7,
+            },
+        })
+
+        self.assertEqual(result["profile_version"], "v9.2")
+        self.assertEqual(result["execution_directives"]["tone"], "克制")
+
+    def test_strategy_compiles_profile_evidence_into_short_execution_directives(self):
+        from strategy import build_strategy
+
+        long_tone = (
+            "面向法国大众受众默认使用 vous，并在整条广告中保持称谓一致；"
+            "只有品牌和受众明确偏年轻亲密时才测试 tu；该判断仍需母语者校准。"
+        )
+        long_scene = (
+            "法国服饰样板先测试克制、留白和材质细节的视觉方向；"
+            "同时保留真人穿着与真实评价；该方向不是消费者普遍事实。"
+        )
+        result = build_strategy({
+            "market": "fr", "platform": "Meta", "audience": "法国都市成年人",
+            "selling_points": ["柔软针织"], "cta": "了解系列",
+            "profile_summary": {
+                "profile_version": "v0.2",
+                "tone": f"{long_tone}；{long_scene}",
+                "scene": long_scene,
+                "risk_notes": "避免身体羞辱和无证据的效果承诺；具体法律适用范围仍需人工复核。",
+                "evidence_ids": ["fr-001", "fr-005"],
+                "risk_evidence_ids": ["fr-002"],
+                "confidence": 0.7,
+                "evidence": [
+                    {"id": "fr-001", "type": "语言风格", "content": long_tone,
+                     "confidence": 0.7, "evidence_level": "C", "validation_status": "待母语者校准"},
+                    {"id": "fr-005", "type": "审美偏好", "content": long_scene,
+                     "confidence": 0.7, "evidence_level": "C", "validation_status": "待样本校准"},
+                ],
+                "risk_evidence": [
+                    {"id": "fr-002", "type": "文化禁忌",
+                     "content": "避免身体羞辱和无证据的效果承诺；具体法律适用范围仍需人工复核。",
+                     "confidence": 0.9, "evidence_level": "A", "validation_status": "公开来源已核对"},
+                ],
+            },
+        })
+
+        self.assertIn("execution_directives", result)
+        self.assertIn("directive_trace", result)
+        self.assertLess(len(result["tone_direction"]), len(long_tone))
+        self.assertLess(len(result["scene_direction"]), len(long_scene))
+        self.assertEqual(result["directive_trace"]["tone_ids"], ["fr-001"])
+        self.assertEqual(result["directive_trace"]["visual_ids"], ["fr-005"])
+        self.assertEqual(result["directive_trace"]["risk_ids"], ["fr-002"])
+        self.assertEqual(result["profile_version"], "v0.2")
 
     def test_demo_variant_contract(self):
         from generate_demo_meta_kr_fashion import build_demo_package
@@ -545,6 +1298,178 @@ class TestBusinessLayers(unittest.TestCase):
         self.assertEqual(package["strategy"]["market"], "kr")
         self.assertEqual(package["strategy"]["selling_points"], ["弹力面料", "通勤约会两用"])
         self.assertEqual(package["kreado"]["json"]["market"], "kr")
+        self.assertEqual(package["strategy"]["profile_version"], package["insight"]["profile_version"])
+        self.assertEqual(
+            package["kreado"]["json"]["evidence_trace"]["profile_version"],
+            package["insight"]["profile_version"],
+        )
+
+    def test_creative_package_compiles_risk_trace_and_platform_execution_separately(self):
+        from feishu_connector import build_creative_package
+
+        package = build_creative_package(
+            {
+                "目标市场": "fr", "平台": "Meta", "产品品类": "服饰",
+                "目标人群": "法国都市成年人",
+            },
+            {
+                "copy": "Une maille douce au quotidien.",
+                "elements": {"selling_points": ["柔软针织"], "cta": "了解系列"},
+            },
+        )
+
+        directives = package["strategy"]["execution_directives"]
+        trace = package["strategy"]["directive_trace"]
+        self.assertEqual(directives["platform"], "短句、清晰视觉层级、单一行动号召")
+        self.assertNotIn("素材测试平台", directives["platform"])
+        self.assertNotIn("基于画像条目", directives["visual"])
+        self.assertNotIn("fr-", directives["visual"])
+        self.assertEqual(trace["tone_ids"], ["fr-001"])
+        self.assertEqual(trace["visual_ids"], ["fr-005"])
+        self.assertIn("fr-002", trace["risk_ids"])
+        self.assertEqual(
+            package["kreado"]["json"]["evidence_trace"]["directive_trace"]["risk_ids"],
+            trace["risk_ids"],
+        )
+
+    def test_creative_package_contains_reproducible_run_snapshot_without_secrets(self):
+        from feishu_connector import build_creative_package
+
+        task = {
+            "任务ID": "FR-SNAPSHOT-001", "中文原文": "柔软针织，活动自在。",
+            "目标市场": "fr", "平台": "Meta", "产品品类": "服饰",
+            "目标人群": "法国都市成年人",
+        }
+        result = {
+            "copy": "Une maille douce au quotidien.", "copy_zh": "日常柔软针织。",
+            "final_status": "pass", "used_entries": ["fr-001", "fr-005"],
+            "profile_version": "v0.2", "errors": None,
+            "profile_trace": {"valid_ids": ["fr-001", "fr-005"], "invalid_ids": []},
+            "fidelity": {"recovery_rate": 1.0, "checks": []},
+            "taboo": {"risk_level": "low", "flags": []},
+            "elements": {"selling_points": ["柔软针织"], "cta": "了解系列"},
+        }
+
+        package = build_creative_package(task, result)
+        snapshot = package["run_snapshot"]
+        self.assertTrue(snapshot["run_id"].startswith("run_"))
+        self.assertEqual(snapshot["task_id"], "FR-SNAPSHOT-001")
+        self.assertEqual(snapshot["market"], "fr")
+        self.assertEqual(snapshot["profile_version"], "v0.2")
+        self.assertEqual(snapshot["used_entries"], ["fr-001", "fr-005"])
+        self.assertEqual(snapshot["pipeline_status"], "pass")
+        self.assertEqual(snapshot["quality_decision"], package["quality_report"]["release_decision"])
+        self.assertRegex(snapshot["source_hash"], r"^[0-9a-f]{64}$")
+        self.assertRegex(snapshot["output_hash"], r"^[0-9a-f]{64}$")
+        self.assertRegex(snapshot["profile_hash"], r"^[0-9a-f]{64}$")
+        serialized = json.dumps(snapshot, ensure_ascii=False).lower()
+        self.assertNotIn("api_key", serialized)
+        self.assertNotIn("app_secret", serialized)
+        self.assertNotIn("authorization", serialized)
+
+    def test_run_snapshot_is_stable_except_for_identity_and_timestamp(self):
+        from run_ledger import build_run_snapshot
+
+        task = {"任务ID": "T1", "中文原文": "柔软针织", "目标市场": "fr", "平台": "Meta"}
+        result = {
+            "copy": "Maille douce", "final_status": "pass", "profile_version": "v0.2",
+            "used_entries": ["fr-001"], "errors": None,
+            "fidelity": {"recovery_rate": 1.0}, "taboo": {"risk_level": "low"},
+        }
+        first = build_run_snapshot(task, result, quality_decision="publish", run_id="run_fixed", created_at="2026-08-10T10:00:00Z")
+        second = build_run_snapshot(task, result, quality_decision="publish", run_id="run_fixed", created_at="2026-08-10T10:00:00Z")
+        self.assertEqual(first, second)
+        self.assertEqual(first["model"], os.environ.get("LLM_MODEL", "deepseek-v4-pro"))
+
+    def test_run_ledger_appends_jsonl_without_rewriting_previous_entries(self):
+        from run_ledger import append_run_snapshot
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "runs.jsonl"
+            append_run_snapshot({"run_id": "run_1", "pipeline_status": "pass"}, path)
+            append_run_snapshot({"run_id": "run_2", "pipeline_status": "needs_review"}, path)
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual([json.loads(line)["run_id"] for line in lines], ["run_1", "run_2"])
+
+    def test_evidence_candidate_normalizes_source_and_deduplicates_by_content_hash(self):
+        from evidence_candidates import append_evidence_candidate, normalize_evidence_candidate
+
+        raw = {
+            "market": "fr", "entry_type": "文化禁忌",
+            "candidate_claim": "避免身体羞辱和未经证实的效果承诺",
+            "publisher": "ARPP", "title": "Image et respect de la personne",
+            "url": "https://example.com/rule", "quote": "Respect de la personne.",
+            "retrieved_at": "2026-08-10", "evidence_level": "A",
+        }
+        candidate = normalize_evidence_candidate(raw)
+        self.assertEqual(candidate["status"], "待确认")
+        self.assertEqual(candidate["market_code"], "fr")
+        self.assertRegex(candidate["content_hash"], r"^[0-9a-f]{64}$")
+        self.assertEqual(candidate["source_url"], raw["url"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "evidence.jsonl"
+            self.assertTrue(append_evidence_candidate(candidate, path))
+            self.assertFalse(append_evidence_candidate(candidate, path))
+            self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_unconfirmed_evidence_candidate_cannot_be_applied_to_profile(self):
+        from evidence_candidates import candidate_to_revision
+
+        candidate = {
+            "market_code": "fr", "entry_type": "语言风格",
+            "candidate_claim": "默认使用 vous", "status": "待确认",
+            "content_hash": "a" * 64,
+        }
+        with self.assertRaises(ValueError):
+            candidate_to_revision(candidate)
+
+    def test_confirmed_evidence_candidate_becomes_revision_candidate_with_provenance(self):
+        from evidence_candidates import candidate_to_revision
+
+        candidate = {
+            "market_code": "fr", "entry_type": "语言风格",
+            "candidate_claim": "默认使用 vous", "status": "已确认",
+            "content_hash": "a" * 64, "publisher": "manual", "source_url": "https://example.com",
+            "evidence_level": "B", "retrieved_at": "2026-08-10",
+        }
+        revision = candidate_to_revision(candidate)
+        self.assertEqual(revision["action"], "new")
+        self.assertEqual(revision["entry_type"], "语言风格")
+        self.assertIn("a" * 64, revision["reason"])
+
+    def test_evidence_source_adapters_normalize_manual_arpp_and_fevad_extracts(self):
+        from evidence_sources import adapt_evidence, available_sources
+
+        self.assertEqual(available_sources(), ["ARPP", "FEVAD", "manual"])
+        for source_name, publisher, level in (("manual", "教练摘录", "C"), ("ARPP", "ARPP", "A"), ("FEVAD", "FEVAD", "A")):
+            candidate = adapt_evidence(source_name, {
+                "market_code": "fr", "entry_type": "文化禁忌", "candidate_claim": "保留原始摘录，待确认",
+                "title": "source title", "url": "https://example.com/source", "quote": "原始摘录",
+            }, publisher=publisher)
+            self.assertEqual(candidate["publisher"], publisher)
+            self.assertEqual(candidate["evidence_level"], level)
+            self.assertEqual(candidate["status"], "待确认")
+            self.assertRegex(candidate["content_hash"], r"^[0-9a-f]{64}$")
+
+    def test_evidence_source_adapter_rejects_unknown_source_and_never_auto_confirms(self):
+        from evidence_sources import adapt_evidence
+
+        raw = {"market_code": "fr", "entry_type": "语言风格", "candidate_claim": "候选", "url": "https://example.com"}
+        with self.assertRaises(ValueError):
+            adapt_evidence("crawler", raw)
+        candidate = adapt_evidence("ARPP", raw)
+        self.assertEqual(candidate["status"], "待确认")
+
+    def test_adapted_evidence_uses_existing_append_and_dedup_gate(self):
+        from evidence_sources import append_adapted_evidence
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "candidates.jsonl"
+            raw = {"market_code": "fr", "entry_type": "语言风格", "candidate_claim": "候选",
+                   "url": "https://example.com", "quote": "摘录"}
+            self.assertTrue(append_adapted_evidence("ARPP", raw, path=str(path)))
+            self.assertFalse(append_adapted_evidence("ARPP", raw, path=str(path)))
 
     def test_creative_package_accepts_nested_feishu_fields_and_aliases(self):
         from feishu_connector import build_creative_package
@@ -610,6 +1535,46 @@ class TestBusinessLayers(unittest.TestCase):
         self.assertIn("prompt", result)
         self.assertEqual(result["json"]["duration_seconds"], 15)
         self.assertIn("Meta", result["prompt"])
+
+    def test_kreado_prompt_uses_execution_directives_and_keeps_evidence_out_of_prompt(self):
+        from kreado_adapter import to_kreado_brief
+
+        evidence_quote = "La publicité ne doit pas porter atteinte à la dignité."
+        source_url = "https://example.com/france-ad-rule"
+        result = to_kreado_brief({
+            "market": "fr", "platform": "Meta", "copy": "Une maille douce au quotidien.",
+            "hook": "前三秒展示针织材质和真实动作", "audience": "法国都市成年人",
+            "selling_points": ["柔软针织", "活动自在"], "cta": "了解系列",
+            "visual_direction": "通勤与周末真实场景", "duration_seconds": 15,
+            "tone_direction": "克制、自然，默认使用 vous",
+            "risk_notes": "避免身体羞辱和无依据的效果承诺",
+            "profile_version": "v0.2",
+            "execution_directives": {
+                "tone": "克制、自然，默认使用 vous",
+                "scene": "通勤与周末真实场景",
+                "visual": "突出针织材质和真实动作",
+                "platform": "短句、清晰视觉层级、单一行动号召",
+                "avoid": ["身体羞辱", "无依据的效果承诺"],
+            },
+            "directive_trace": {
+                "tone_ids": ["fr-001"], "scene_ids": ["fr-005"],
+                "visual_ids": ["fr-005"], "platform_ids": [], "risk_ids": ["fr-002"],
+            },
+            "evidence_ids": ["fr-001", "fr-005"],
+            "risk_evidence_ids": ["fr-002"],
+            "evidence_details": [{"id": "fr-002", "quote": evidence_quote, "source_urls": [source_url]}],
+            "source_urls": [source_url],
+            "validation_status": "待母语者校准",
+            "unverified_claims": ["服饰适用性待验证"],
+        })
+
+        self.assertNotIn(evidence_quote, result["prompt"])
+        self.assertNotIn(source_url, result["prompt"])
+        self.assertLess(len(result["prompt"]), 500)
+        self.assertEqual(result["json"]["execution_directives"]["tone"], "克制、自然，默认使用 vous")
+        self.assertEqual(result["json"]["evidence_trace"]["profile_version"], "v0.2")
+        self.assertEqual(result["json"]["evidence_trace"]["source_urls"], [source_url])
+        self.assertEqual(result["json"]["evidence_trace"]["directive_trace"]["risk_ids"], ["fr-002"])
 
 
 class _FakeBitableClient:
@@ -740,7 +1705,7 @@ class TestFeishuClosedLoop(unittest.TestCase):
         client._tables["revision"] = [
             {"record_id": "c-001", "fields": {"目标市场": "kr", "状态": "已采纳", "动作": "新增",
                 "目标条目ID": "", "条目类型": "语言风格", "新条目内容": "新条目", "建议置信度": "中",
-                "建议过期时间": "", "依据理由": "多轮反馈"}},
+                "建议过期时间": "", "依据理由": "多轮反馈", "引用审核记录": "rv-001, rv-002"}},
             {"record_id": "c-002", "fields": {"目标市场": "kr", "状态": "已采纳", "动作": "过期",
                 "目标条目ID": "kr-003", "条目类型": "", "新条目内容": "", "建议置信度": "",
                 "建议过期时间": "", "依据理由": ""}},
@@ -764,6 +1729,8 @@ class TestFeishuClosedLoop(unittest.TestCase):
         self.assertEqual(set(captured.keys()), {"kr", "jp"})
         self.assertEqual([c["action"] for c in captured["kr"]], ["new", "expire"])
         self.assertEqual(captured["kr"][0]["content"], "新条目")
+        self.assertEqual(captured["kr"][0]["revision_record_id"], "c-001")
+        self.assertEqual(captured["kr"][0]["review_record_ids"], ["rv-001", "rv-002"])
         self.assertEqual(captured["jp"][0]["action"], "modify")
         status = {r["record_id"]: r["fields"]["状态"] for r in client._tables["revision"]}
         self.assertEqual(status["c-001"], "已应用")
@@ -847,6 +1814,90 @@ class TestFeishuClosedLoop(unittest.TestCase):
             self.assertEqual(data["version"], "v0.1")  # 未落盘
             self.assertEqual(data["entries"][0]["content"], "无ID条目")
             self.assertFalse(os.path.exists(path + ".tmp"))
+
+    def test_profile_history_snapshots_before_update_with_provenance_and_diff(self):
+        from profile_history import ProfileHistory
+
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = Path(td) / "profiles" / "fr.json"
+            history_dir = Path(td) / "profiles" / "history"
+            old = {
+                "market_code": "fr", "version": "v0.2", "entries": [
+                    {"id": "fr-001", "type": "语言风格", "content": "旧"},
+                ],
+            }
+            new = {
+                "market_code": "fr", "version": "v0.3", "entries": [
+                    {"id": "fr-001", "type": "语言风格", "content": "新"},
+                ],
+            }
+            profile_path.parent.mkdir(parents=True)
+            profile_path.write_text(json.dumps(old, ensure_ascii=False, indent=2), encoding="utf-8")
+            history = ProfileHistory(history_dir)
+            snapshot = history.snapshot_before_update(
+                old,
+                market_code="fr",
+                profile_path=profile_path,
+                source="飞书审核反馈",
+                review_record_ids=["rv-001", "c-001"],
+            )
+            self.assertEqual(snapshot.name, "fr-v0.2.json")
+            self.assertEqual(json.loads(snapshot.read_text(encoding="utf-8")), old)
+            history.record_update(snapshot, old, new, source="飞书审核反馈", review_record_ids=["rv-001", "c-001"])
+            manifest = history.manifest_path.read_text(encoding="utf-8").splitlines()
+            record = json.loads(manifest[-1])
+            self.assertEqual(record["source"], "飞书审核反馈")
+            self.assertEqual(record["review_record_ids"], ["rv-001", "c-001"])
+            self.assertEqual(record["before_version"], "v0.2")
+            self.assertEqual(record["after_version"], "v0.3")
+            self.assertIn("旧", record["diff"])
+            self.assertIn("新", record["diff"])
+
+    def test_profile_history_rollback_restores_snapshot_without_deleting_history(self):
+        from profile_history import ProfileHistory
+
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = Path(td) / "profiles" / "fr.json"
+            history_dir = Path(td) / "profiles" / "history"
+            old = {"market_code": "fr", "version": "v0.2", "entries": [{"id": "fr-001", "content": "旧"}]}
+            current = {"market_code": "fr", "version": "v0.3", "entries": [{"id": "fr-001", "content": "新"}]}
+            profile_path.parent.mkdir(parents=True)
+            profile_path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+            history = ProfileHistory(history_dir)
+            snapshot = history.snapshot_before_update(old, market_code="fr", profile_path=profile_path, source="test")
+            history.record_update(snapshot, old, current, source="test")
+            restored = history.rollback("fr", "v0.2", profile_path=profile_path)
+            self.assertEqual(restored["version"], "v0.2")
+            self.assertEqual(json.loads(profile_path.read_text(encoding="utf-8")), old)
+            self.assertTrue(snapshot.exists())
+            self.assertTrue((history_dir / "fr-v0.3.json").exists())
+            records = [json.loads(line) for line in history.manifest_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(records[-1]["operation"], "rollback")
+            self.assertEqual(records[-1]["restored_version"], "v0.2")
+
+    def test_apply_revisions_creates_history_snapshot_before_profile_update(self):
+        from review_ai import apply_revisions_to_profile
+
+        with tempfile.TemporaryDirectory() as td:
+            profile_path = Path(td) / "fr.json"
+            history_dir = Path(td) / "history"
+            profile_path.write_text(json.dumps({
+                "market_code": "fr", "version": "v0.2", "entries": [
+                    {"id": "fr-001", "type": "语言风格", "content": "旧", "confidence": "中"},
+                ],
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            apply_revisions_to_profile(
+                "fr",
+                [{"action": "modify", "target_entry_id": "fr-001", "content": "新", "confidence": "高",
+                  "revision_record_id": "c-001"}],
+                profile_path=str(profile_path),
+                history_dir=str(history_dir),
+            )
+            snapshot = history_dir / "fr-v0.2.json"
+            self.assertTrue(snapshot.exists())
+            self.assertEqual(json.loads(snapshot.read_text(encoding="utf-8"))["entries"][0]["content"], "旧")
+            record = json.loads((history_dir / "manifest.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(record["revision_record_ids"], ["c-001"])
 
 
 class TestBorrowedIndustryMethods(unittest.TestCase):
@@ -1070,6 +2121,9 @@ class TestBorrowedIndustryMethods(unittest.TestCase):
         self.assertEqual(len({v["creative_route"]["route_id"] for v in package["variants"]}), 3)
         self.assertTrue(all("transcreation_delivery" in v for v in package["variants"]))
         self.assertTrue(all("quality_report" in v["transcreation_delivery"] for v in package["variants"]))
+        self.assertTrue(all("run_snapshot" in v for v in package["variants"]))
+        self.assertTrue(all(v["run_snapshot"] == v["transcreation_delivery"]["run_snapshot"] for v in package["variants"]))
+        self.assertTrue(all(v["run_snapshot"]["directive_trace"] == v["creative_strategy"]["directive_trace"] for v in package["variants"]))
 
     def test_feishu_uses_existing_brief_field_for_transcreation_delivery(self):
         from feishu_connector import _merge_package_fields

@@ -17,6 +17,7 @@ from creative_matrix import build_creative_matrix
 from kreado_adapter import to_kreado_brief
 from language_assets import build_language_assets
 from pipeline import localize
+from run_ledger import build_run_snapshot
 from transcreation_delivery import build_transcreation_delivery
 
 
@@ -106,6 +107,13 @@ def build_demo_package(runner: Callable[..., Dict[str, Any]] = localize) -> Dict
             "validation_status": strategy.get("validation_status", "待人工复核"),
         })
         delivery = build_transcreation_delivery(result, route, kreado, assets)
+        run_snapshot = build_run_snapshot(
+            task,
+            result,
+            quality_decision=delivery["quality_report"]["release_decision"],
+            strategy=strategy,
+        )
+        delivery["run_snapshot"] = run_snapshot
         variants.append({
             "variant_id": route["route_id"],
             "variant_label": route["objective"],
@@ -117,6 +125,7 @@ def build_demo_package(runner: Callable[..., Dict[str, Any]] = localize) -> Dict
             "market_insight": package["insight"],
             "creative_strategy": strategy,
             "kreado_brief": kreado,
+            "run_snapshot": run_snapshot,
             "transcreation_delivery": delivery,
         })
 

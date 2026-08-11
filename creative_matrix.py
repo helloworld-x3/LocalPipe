@@ -14,6 +14,7 @@ def build_creative_matrix(strategy: Dict[str, Any], count: int = 3) -> List[Dict
     tone = str(strategy.get("tone_direction") or "自然、可信").strip()
     hook = str(strategy.get("hook") or "先展示真实问题，再给出产品证据").strip()
     evidence_ids = list(strategy.get("evidence_ids") or [])
+    directive_trace = dict(strategy.get("directive_trace") or {})
     cta = str(strategy.get("cta") or "了解更多").strip()
     platform = str(strategy.get("platform") or "Meta").strip()
 
@@ -49,4 +50,5 @@ def build_creative_matrix(strategy: Dict[str, Any], count: int = 3) -> List[Dict
     for route in routes:
         route["evidence_ids"] = evidence_ids
         route["platform"] = platform
+        route["directive_trace"] = directive_trace
     return routes[: max(1, min(int(count), len(routes)))]
