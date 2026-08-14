@@ -25,20 +25,21 @@ class RateLimiter:
         self.lock = threading.Lock()
 
     def acquire(self):
-        with self.lock:
-            now = time.monotonic()
-            elapsed = now - self.last_fill
-            self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
-            self.last_fill = now
+        # 不持锁 sleep：等待期间释放锁，避免令牌桶退化为全局串行器
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                elapsed = now - self.last_fill
+                self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+                self.last_fill = now
 
-            if self.tokens >= 1.0:
-                self.tokens -= 1.0
-                return
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
 
-            wait = (1.0 - self.tokens) / self.rate
+                wait = (1.0 - self.tokens) / self.rate
+                self.tokens = 0.0
             time.sleep(wait)
-            self.tokens = 0.0
-            self.last_fill = time.monotonic()
 
 # 全局速率限制器实例
 _rate_limiter = RateLimiter(rate=3.0, burst=5)
@@ -216,9 +217,13 @@ class ModelClient:
         return text, tool_calls
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def safe_print(*args, end="\n", flush=False, **kwargs):
-    """GBK 安全打印"""
+    """GBK 安全打印（剥离 ANSI 转义，防 LLM 输出操纵终端）"""
     text = " ".join(str(a) for a in args) + end
+    text = _ANSI_RE.sub("", text)
     try:
         sys.stdout.write(text.encode("gbk", errors="replace").decode("gbk"))
     except Exception:
@@ -229,16 +234,20 @@ def safe_print(*args, end="\n", flush=False, **kwargs):
 
 # ========== LLM 响应缓存 ==========
 
+DEFAULT_CACHE_TTL = 7 * 24 * 3600  # 缓存 7 天后过期
+
+
 class Cache:
     """文件级缓存：避免重复 API 调用。线程安全。"""
 
-    def __init__(self, cache_dir=None, max_entries=1000):
+    def __init__(self, cache_dir=None, max_entries=1000, ttl=DEFAULT_CACHE_TTL):
         if cache_dir is None:
             cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
         self.cache_dir = cache_dir
         self.cache_file = os.path.join(cache_dir, "llm_cache.json")
         self._data = None
         self._max_entries = max_entries
+        self._ttl = ttl
         self._lock = threading.Lock()
 
     def _load(self):
@@ -258,7 +267,12 @@ class Cache:
         with self._lock:
             self._load()
             entry = self._data.get(key)
-            return entry["value"] if entry else None
+            if not entry:
+                return None
+            if self._ttl is not None and time.time() - entry.get("ts", 0) > self._ttl:
+                del self._data[key]
+                return None
+            return entry["value"]
 
     def set(self, key, value):
         with self._lock:

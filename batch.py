@@ -105,7 +105,7 @@ def run_batch(creatives_path, market_codes, with_baseline=True, workers=3):
     # 实验批次不注入全局品牌上下文：brand_context.json 是 CoolClip 专属，
     # 套到多产品批次会污染每条创意（口红/坚果被强制改成 CoolClip）
     brand = None
-    ts = datetime.now().strftime("%m%d_%H%M")
+    ts = datetime.now().strftime("%m%d_%H%M%S")
     os.makedirs(os.path.join(BASE_DIR, "outputs"), exist_ok=True)
 
     full_results = []

@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from market_code import validate_market_code
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_LEDGER_PATH = BASE_DIR / ".cache" / "run_ledger.jsonl"
@@ -40,6 +42,10 @@ def _canonical_hash(value: Any) -> str:
 
 
 def _profile_hash(market_code: str) -> str:
+    market_code = str(market_code or "").strip().lower()
+    if not market_code:
+        return ""
+    market_code = validate_market_code(market_code)
     path = BASE_DIR / "profiles" / f"{market_code}.json"
     if not path.is_file():
         return ""

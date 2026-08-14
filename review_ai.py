@@ -10,12 +10,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 import time
 from datetime import date
 from typing import Any, Dict, List, Optional
 
 from pipeline import _llm_json, load_profile, profile_context
+from model import sanitize_user_input
 from profile_history import ProfileHistory
+from market_code import validate_market_code
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -67,11 +70,15 @@ def summarize_feedback(reviews: List[Dict[str, Any]], market_code: str) -> Dict[
     profile = load_profile(market_code)
     ctx = profile_context(profile)
 
+    def _san(v: Any) -> str:
+        v = str(v or "").strip()
+        return sanitize_user_input(v) if v else ""
+
     review_lines = [
-        f"[审核记录{i}] 自然度:{r.get('自然度', '')} 地道感:{r.get('地道感', '')} "
-        f"吸引力:{r.get('广告吸引力', '')} 采用意见:{r.get('采用意见', '')} "
-        f"问题类型:{r.get('问题类型', '')} 反馈:{r.get('原始反馈', '')} "
-        f"修改建议:{r.get('修改建议', '')}"
+        f"[审核记录{i}] 自然度:{_san(r.get('自然度'))} 地道感:{_san(r.get('地道感'))} "
+        f"吸引力:{_san(r.get('广告吸引力'))} 采用意见:{_san(r.get('采用意见'))} "
+        f"问题类型:{_san(r.get('问题类型'))} 反馈:{_san(r.get('原始反馈'))} "
+        f"修改建议:{_san(r.get('修改建议'))}"
         for i, r in enumerate(reviews, 1)
     ]
 
@@ -175,7 +182,7 @@ def apply_revisions_to_profile(
     安全约束：temp 写入 + os.replace 原子替换；写前 json round-trip 自检；
     entries 全部含 id 才落盘；不自动调用 gen_profile_hashes（调用方负责）。
     """
-    market_code = str(market_code or "").strip().lower()
+    market_code = validate_market_code(market_code)
     path = profile_path or os.path.join(BASE_DIR, "profiles", f"{market_code}.json")
     if not os.path.isfile(path):
         raise FileNotFoundError(f"没有画像文件: {path}")
@@ -250,10 +257,14 @@ def apply_revisions_to_profile(
         review_record_ids=review_record_ids,
     )
 
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(raw)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".profile-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(raw)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     history.record_update(
         snapshot,
         before_profile,

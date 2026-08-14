@@ -55,6 +55,11 @@ OUTPUT_FIELDS = [
     "KreadoAI JSON", "卖点保真率", "禁忌风险", "系统状态", "画像条目", "画像版本",
     "适配说明", "文化风险提示", "调研依据", "洞察置信度", "错误信息", "生成时间",
     "证据等级", "证据明细", "来源URL", "画像校准状态", "未核验声明",
+    # Competitive-mode additive fields.  Existing bases can add these columns
+    # without changing the legacy output columns above.
+    "候选变体数", "候选变体", "系统推荐变体", "推荐分数", "推荐排名", "推荐理由",
+    "审核策略", "不确定性", "候选选择决策",
+    "KreadoAI Brief 1", "KreadoAI Brief 2", "KreadoAI Brief 3",
 ]
 
 
@@ -69,7 +74,14 @@ def _request(method: str, url: str, token: Optional[str] = None, body: Any = Non
         ) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"飞书API HTTP {exc.code}: {exc.read().decode('utf-8', errors='replace')[:500]}") from exc
+        # 只回显飞书自己的错误码/消息，避免把可能含敏感字段的响应体原文写进日志
+        try:
+            detail = json.loads(exc.read().decode("utf-8", errors="replace"))
+        except Exception:
+            detail = {}
+        err_code = detail.get("code", "") if isinstance(detail, dict) else ""
+        err_msg = str(detail.get("msg", ""))[:200] if isinstance(detail, dict) else ""
+        raise RuntimeError(f"飞书API HTTP {exc.code} code={err_code} msg={err_msg}") from exc
     if payload.get("code", 0) != 0:
         raise RuntimeError(f"飞书API返回错误: {payload}")
     return payload
@@ -309,9 +321,21 @@ def build_market_insight(task: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def build_creative_package(task: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+def _build_strategy_package(task: Dict[str, Any], result: Dict[str, Any], route: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build one auditable strategy/Brief for a pipeline result or route candidate."""
     insight = build_market_insight(task)
     elements = result.get("elements") or {}
+    route = route or {"route_id": "default", "objective": "证据驱动创译"}
+    routed_result = dict(result)
+    # Candidate records carry their own localized output and quality traces but
+    # share the deconstructed elements/profile with the winner.
+    if route.get("copy") is not None:
+        routed_result.update({key: route.get(key) for key in (
+            "copy", "copy_zh", "adaptation_note", "used_entries", "profile_trace",
+            "fidelity", "taboo", "final_status", "errors",
+        ) if key in route})
+    creative_route = route.get("creative_route") or route
+    placeholder_copy = "候选未生成文案（仅供审核，禁止投放）"
     strategy = build_strategy({
         "market": _field(task, FIELD_MARKET),
         "platform": _field(task, "平台", "Meta") or "Meta",
@@ -338,24 +362,28 @@ def build_creative_package(task: Dict[str, Any], result: Dict[str, Any]) -> Dict
             "risk_evidence_ids": insight.get("risk_evidence_ids", []),
             "confidence": insight["confidence"],
         },
-        "copy": result.get("copy", ""),
-        "visual_direction": insight["creative_direction"],
+        # ``to_kreado_brief`` requires non-empty copy.  A failed candidate is
+        # still shown to reviewers with a clearly non-publishable placeholder;
+        # its original empty copy/error remains intact in ``localpipe_result``.
+        "copy": routed_result.get("copy", "") or placeholder_copy,
+        "visual_direction": creative_route.get("visual_direction") or insight["creative_direction"],
     })
+    strategy["creative_route"] = creative_route
+    strategy["route_id"] = route.get("route_id", "default")
+    if route.get("objective"):
+        strategy["route_objective"] = route["objective"]
     kreado = to_kreado_brief(strategy)
     language_assets = build_language_assets(_task_brand(task), {
         "evidence_ids": insight.get("evidence_ids", []),
         "validation_status": insight.get("validation_status", "待人工复核"),
     })
-    quality_report = build_quality_report(result)
-    default_route = {
-        "route_id": "default",
-        "objective": "证据驱动创译",
-        "recommended_use": f"{strategy['platform']} 人工审核候选",
-    }
-    delivery = build_transcreation_delivery(result, default_route, kreado, language_assets)
+    quality_report = build_quality_report(routed_result)
+    delivery_result = dict(routed_result)
+    delivery_result["copy"] = delivery_result.get("copy", "") or placeholder_copy
+    delivery = build_transcreation_delivery(delivery_result, creative_route, kreado, language_assets)
     run_snapshot = build_run_snapshot(
         task,
-        result,
+        routed_result,
         quality_decision=quality_report["release_decision"],
         strategy=strategy,
     )
@@ -369,6 +397,82 @@ def build_creative_package(task: Dict[str, Any], result: Dict[str, Any]) -> Dict
         "run_snapshot": run_snapshot,
         "transcreation_delivery": delivery,
     }
+
+
+def build_creative_package(task: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the legacy winner package plus three competitive candidates.
+
+    ``pipeline.localize`` keeps its public shape: the selected candidate is
+    still represented by the top-level fields, while ``candidates`` is an
+    additive audit trail.  Each candidate receives an independent strategy,
+    quality report and KreadoAI Brief; no KreadoAI API is called here.
+    """
+    winner_package = _build_strategy_package(task, result)
+    candidates = result.get("candidates") or []
+    variants = []
+    if candidates:
+        # The pipeline normally returns exactly three routes.  Preserve all
+        # returned candidates (including gated/error candidates) for review.
+        for candidate in candidates[:3]:
+            candidate_package = _build_strategy_package(task, result, candidate)
+            variants.append({
+                "variant_id": candidate.get("route_id", f"variant_{len(variants) + 1}"),
+                "variant_label": (candidate.get("creative_route") or {}).get("objective", candidate.get("route_id", "")),
+                "creative_route": candidate.get("creative_route") or {},
+                "localpipe_result": candidate,
+                # Keep the quality/selection contract addressable directly on
+                # each variant as well as under localpipe_result.
+                "fidelity": candidate.get("fidelity") or {},
+                "taboo": candidate.get("taboo") or {},
+                "profile_trace": candidate.get("profile_trace") or {},
+                "score": candidate.get("score"),
+                "rank": candidate.get("rank"),
+                "eligible": candidate.get("eligible"),
+                "hard_gate_reasons": candidate.get("hard_gate_reasons") or [],
+                "creative_strategy": candidate_package["strategy"],
+                "kreado_brief": candidate_package["kreado"],
+                "quality_report": candidate_package["quality_report"],
+                "transcreation_delivery": candidate_package["transcreation_delivery"],
+                "run_snapshot": candidate_package["run_snapshot"],
+            })
+    selected_route_id = (result.get("selection_trace") or {}).get("selected_route_id") or ""
+    decision = {
+        "selected_route_id": selected_route_id if candidates else "default",
+        "review_policy": result.get("review_policy", "sample"),
+        "uncertainty": result.get("uncertainty", {}),
+        "selection_trace": result.get("selection_trace", {}),
+        "rankings": [
+            {key: candidate.get(key) for key in ("rank", "route_id", "score", "eligible", "hard_gate_reasons", "components")}
+            for candidate in candidates
+        ],
+    }
+    selected = next((item for item in candidates if selected_route_id and item.get("route_id") == selected_route_id and item.get("eligible") is True), None)
+    if selected:
+        reasons = []
+        if selected.get("eligible"):
+            reasons.append("通过硬门禁")
+        else:
+            reasons.append("保留为诊断候选")
+        reasons.append(f"得分 {float(selected.get('score', 0.0)):.4f}")
+        if selected.get("rank") is not None:
+            reasons.append(f"排名第 {selected['rank']}")
+        if selected.get("hard_gate_reasons"):
+            reasons.append("门禁原因：" + ", ".join(selected["hard_gate_reasons"]))
+        recommendation_reason = "；".join(reasons)
+        recommendation_score = selected.get("score", "")
+        recommendation_rank = selected.get("rank", "")
+    else:
+        recommendation_reason = "无可发布候选" if (decision["review_policy"] == "block" or candidates) else "无候选选择结果"
+        recommendation_score = ""
+        recommendation_rank = ""
+    winner_package["variants"] = variants
+    winner_package["variant_count"] = len(variants)
+    winner_package["recommended_variant_id"] = selected_route_id if candidates else "default"
+    winner_package["selection_decision"] = decision
+    winner_package["recommendation_reason"] = recommendation_reason
+    winner_package["recommendation_score"] = recommendation_score
+    winner_package["recommendation_rank"] = recommendation_rank
+    return winner_package
 
 
 def _merge_package_fields(fields: Dict[str, Any], package: Dict[str, Any]) -> None:
@@ -396,6 +500,21 @@ def _merge_package_fields(fields: Dict[str, Any], package: Dict[str, Any]) -> No
         "KreadoAI Prompt": package["kreado"]["prompt"],
         "KreadoAI JSON": json.dumps(package["kreado"]["json"], ensure_ascii=False),
     })
+    variants = package.get("variants") or []
+    fields.update({
+        "候选变体数": len(variants),
+        "候选变体": json.dumps(variants, ensure_ascii=False),
+        "系统推荐变体": package.get("recommended_variant_id", "default"),
+        "推荐分数": str(package.get("recommendation_score", "")),
+        "推荐排名": str(package.get("recommendation_rank", "")),
+        "推荐理由": package.get("recommendation_reason", ""),
+        "审核策略": (package.get("selection_decision") or {}).get("review_policy", ""),
+        "不确定性": json.dumps((package.get("selection_decision") or {}).get("uncertainty", {}), ensure_ascii=False),
+        "候选选择决策": json.dumps(package.get("selection_decision", {}), ensure_ascii=False),
+    })
+    for index in range(3):
+        brief = variants[index].get("kreado_brief") if index < len(variants) else {}
+        fields[f"KreadoAI Brief {index + 1}"] = json.dumps(brief, ensure_ascii=False)
 
 
 def process_tasks(tasks: Iterable[Dict[str, Any]], runner=localize) -> List[Dict[str, Any]]:
@@ -408,7 +527,7 @@ def process_tasks(tasks: Iterable[Dict[str, Any]], runner=localize) -> List[Dict
             continue
         result = runner(source, market, brand=_task_brand(task), verbose=False)
         fields = build_output(task, result)
-        if result.get("copy") and result.get("elements"):
+        if result.get("elements") and (result.get("copy") or result.get("candidates")):
             package = build_creative_package(task, result)
             _merge_package_fields(fields, package)
         outputs.append({"task": task, "result": result, "fields": fields})
@@ -423,7 +542,62 @@ def _output_task_id(record: Dict[str, Any]) -> str:
     return str(_field(record, FIELD_TASK_ID, "") or _field(record, "task_id", "")).strip()
 
 
-def run_live(client: Optional[FeishuBitableClient] = None, checkpoint_store: Optional[CheckpointStore] = None) -> int:
+def _process_one_task(
+    client: FeishuBitableClient,
+    checkpoint_store: CheckpointStore,
+    task: Dict[str, Any],
+    existing: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    checkpoint = checkpoint_store.load(task)
+    if existing:
+        if checkpoint and not checkpoint.get("output_written"):
+            checkpoint_store.mark_output_written(task, str(existing.get("record_id", "")))
+        output_status = str(_field(existing, "系统状态", "")).strip().lower()
+        client.update_task(task["record_id"], {FIELD_STATUS: "异常" if output_status == "error" else "待审核"})
+        return
+
+    if checkpoint and checkpoint.get("output_written"):
+        result = checkpoint.get("result") or {"final_status": "error"}
+        client.update_task(task["record_id"], {FIELD_STATUS: _task_result_status(result)})
+        return
+
+    if checkpoint:
+        result = checkpoint.get("result") or {"final_status": "error"}
+        fields = checkpoint.get("fields") or build_output(task, result)
+        run_snapshot = checkpoint.get("run_snapshot") or {}
+    else:
+        client.update_task(task["record_id"], {FIELD_STATUS: "生成中"})
+        result = localize(
+            str(_field(task, FIELD_SOURCE)).strip(),
+            str(_field(task, FIELD_MARKET)).strip(),
+            brand=_task_brand(task),
+            verbose=False,
+        )
+        fields = build_output(task, result)
+        run_snapshot = {}
+        if result.get("elements") and (result.get("copy") or result.get("candidates")):
+            package = build_creative_package(task, result)
+            _merge_package_fields(fields, package)
+            run_snapshot = package["run_snapshot"]
+        checkpoint = checkpoint_store.save_generated(task, result, fields, run_snapshot=run_snapshot)
+
+    output_record_id = client.create_output(fields)
+    checkpoint_store.mark_output_written(task, output_record_id)
+    if run_snapshot:
+        append_run_snapshot(run_snapshot)
+    return result
+
+
+def run_live(
+    client: Optional[FeishuBitableClient] = None,
+    checkpoint_store: Optional[CheckpointStore] = None,
+    task_record_id: Optional[str] = None,
+) -> int:
+    """Process pending Feishu tasks, optionally limiting work to one record.
+
+    The optional record filter is used by the Feishu Automation webhook.  The
+    legacy CLI and callers remain unchanged when it is omitted.
+    """
     app_token = os.environ.get("FEISHU_APP_TOKEN")
     task_table = os.environ.get("FEISHU_TASK_TABLE_ID")
     output_table = os.environ.get("FEISHU_OUTPUT_TABLE_ID")
@@ -439,49 +613,27 @@ def run_live(client: Optional[FeishuBitableClient] = None, checkpoint_store: Opt
     }
     tasks = [
         record for record in client.list_tasks()
+        if not task_record_id or str(record.get("record_id", "")).strip() == str(task_record_id).strip()
         if str(_field(record, FIELD_STATUS, "")).strip() in ("待生成", "生成中")
     ]
+    if task_record_id and not tasks:
+        raise RuntimeError(f"未找到可处理的飞书任务记录: {task_record_id}")
     for task in tasks:
         task_id = _output_task_id(task)
         existing = existing_outputs.get(task_id)
-        checkpoint = checkpoint_store.load(task)
-        if existing:
-            if checkpoint and not checkpoint.get("output_written"):
-                checkpoint_store.mark_output_written(task, str(existing.get("record_id", "")))
-            output_status = str(_field(existing, "系统状态", "")).strip().lower()
-            client.update_task(task["record_id"], {FIELD_STATUS: "异常" if output_status == "error" else "待审核"})
+        try:
+            result = _process_one_task(client, checkpoint_store, task, existing)
+        except Exception as exc:
+            print(f"  [任务失败] {task_id or task.get('record_id')}: {exc}")
+            try:
+                client.update_task(task["record_id"], {FIELD_STATUS: "异常"})
+            except Exception:
+                pass
+            if task_record_id:
+                raise
             continue
-
-        if checkpoint and checkpoint.get("output_written"):
-            result = checkpoint.get("result") or {"final_status": "error"}
+        if result is not None:
             client.update_task(task["record_id"], {FIELD_STATUS: _task_result_status(result)})
-            continue
-
-        if checkpoint:
-            result = checkpoint.get("result") or {"final_status": "error"}
-            fields = checkpoint.get("fields") or build_output(task, result)
-            run_snapshot = checkpoint.get("run_snapshot") or {}
-        else:
-            client.update_task(task["record_id"], {FIELD_STATUS: "生成中"})
-            result = localize(
-                str(_field(task, FIELD_SOURCE)).strip(),
-                str(_field(task, FIELD_MARKET)).strip(),
-                brand=_task_brand(task),
-                verbose=False,
-            )
-            fields = build_output(task, result)
-            run_snapshot = {}
-            if result.get("copy") and result.get("elements"):
-                package = build_creative_package(task, result)
-                _merge_package_fields(fields, package)
-                run_snapshot = package["run_snapshot"]
-            checkpoint = checkpoint_store.save_generated(task, result, fields, run_snapshot=run_snapshot)
-
-        output_record_id = client.create_output(fields)
-        checkpoint_store.mark_output_written(task, output_record_id)
-        if run_snapshot:
-            append_run_snapshot(run_snapshot)
-        client.update_task(task["record_id"], {FIELD_STATUS: _task_result_status(result)})
     print(f"飞书处理完成：{len(tasks)} 条待生成任务")
     return 0
 

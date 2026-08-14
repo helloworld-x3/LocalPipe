@@ -6,10 +6,13 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
+
+from market_code import validate_market_code
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -54,7 +57,7 @@ class ProfileHistory:
         review_record_ids: Optional[Iterable[str]] = None,
     ) -> Path:
         """Persist the exact pre-update JSON once; never overwrite an existing snapshot."""
-        market = str(market_code or profile.get("market_code") or "").strip().lower()
+        market = validate_market_code(market_code or profile.get("market_code"))
         if not market:
             raise ValueError("profile history requires market_code")
         path = Path(profile_path)
@@ -110,8 +113,11 @@ class ProfileHistory:
         return record
 
     def rollback(self, market_code: str, version: str, *, profile_path: Optional[Path | str] = None) -> Dict[str, Any]:
-        market = str(market_code or "").strip().lower()
-        target = self.history_dir / f"{market}-{str(version).strip()}.json"
+        market = validate_market_code(market_code)
+        version = str(version or "").strip()
+        if not re.fullmatch(r"v\d+\.\d+", version):
+            raise ValueError(f"版本号非法: {version!r}（应为 vX.Y 格式）")
+        target = self.history_dir / f"{market}-{version}.json"
         if not target.is_file():
             raise FileNotFoundError(f"没有历史画像快照: {target}")
         restored_text = target.read_text(encoding="utf-8")

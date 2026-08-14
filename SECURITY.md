@@ -54,3 +54,44 @@ Reasonix（AI 安全助手），受乔唯一委托对 LocalPipe v0.1 进行安�
 1. 接入 SAST 工具（如 Bandit）进行自动化安全扫描
 2. 所有用户可见的 LLM 输出做输出过滤（防 XSS/内容注入）
 3. 管线日志脱敏——当前 telemetry 可能记录完整源文案
+
+---
+
+## 审计日期：2026-08-08（第二轮安全审查与修复核验）
+
+### 审计人
+DeepSeek 编程助手（多维度专项审查：安全/漏洞/Bug/性能/质量/架构）。
+
+### 审计结论
+第一轮发现 1 Critical + 2 High + 7 Medium + 8 Low。修复核验后确认 **11 项已修复**（含团队自查修复项），安全评级 **C → B**。当前无 RCE / SSRF / eval / 动态 import 面，比赛与内网部署形态达标；剩余项均为低危或文档类。
+
+### 已修复清单（含位置）
+
+| 问题 | 修复 |
+|------|------|
+| 桥接 token 明文打印日志（Critical） | `feishu_automation.py:179-182` 删除 print，仅 compare_digest 判断 |
+| 桥接服务无限流/无限并发/无请求体上限（High） | `feishu_automation.py:67-69,80,160-162` MAX_BODY_BYTES=64KB（413）、BoundedSemaphore(2)、COMPLETED_TTL=24h |
+| "飞书→画像→Prompt"注入链（High） | `review_ai.py:73-83` 审核反馈逐字段 sanitize；`pipeline.py:353-370` 品牌规则 sanitize；`pipeline.py:483` 回检文案 sanitize；本轮补充 `pipeline.py` `_sanitize_elements()` 覆盖 recreate/fidelity 的源要素 |
+| rollback version 路径穿越（Medium） | `profile_history.py:117-119` 严格正则 `v\d+\.\d+` |
+| 批量无逐任务隔离（Medium） | `feishu_connector.py:619-630` 逐任务 try/except，失败置"异常" |
+| 缓存无 TTL（Medium） | `model.py:237,243,272-274` 默认 TTL 7 天，读取时过期剔除 |
+| RateLimiter 持锁 sleep（Medium） | `model.py:27-42` 锁内算账、锁外等待 |
+| requirements 未锁定（Medium） | `requirements.txt` 锁定 `openai==2.24.0` |
+| challenge 无鉴权回显（Low） | `feishu_automation.py:114-127,170-174` 按 IP 限频（60s/10 次）→ 429 |
+| CLI 演示路径穿越（Low） | `pipeline.py` CLI 写盘前 `validate_market_code` |
+| tmp 文件竞态（Low） | `review_ai.py:260-267` `tempfile.mkstemp` + finally 清理 |
+| 终端 ANSI 注入（Low） | `model.py:220-226` `_ANSI_RE` 剥离转义序列 |
+| 飞书错误响应体回显（Low） | `feishu_connector.py:76-84` 仅回显 code/msg（截断 200 字符） |
+| batch 输出时间戳碰撞（Low） | `batch.py:108` 时间戳精确到秒 |
+
+### 本轮新增能力
+
+- `LOCALPIPE_PARALLEL_ROUTES=1`（默认 0）：三路线并行执行，单任务 LLM 耗时约降为 1/3；`executor.map` 保持候选顺序，选择逻辑不受影响；全局 RateLimiter 仍限制总速率。默认关闭以保证日志/行为顺序确定。
+
+### 剩余待办
+
+1. **画像完整性**：泰/日/美画像目前使用 `thailand.json`、`japan.json`、`usa.json`，由画像内 `market_code` 兼容 `th/jp/us`；后续可统一文件名降低运维歧义
+2. **遥测脱敏**：`_llm_json` 重试错误信息含 `raw[:300]` 片段，可能经 telemetry 落盘源文案回声；建议错误信息不含原文，或 telemetry 写入前对 errors 字段脱敏
+3. **桥接 TLS**：当前明文 HTTP，生产部署必须走 HTTPS 反向代理；`provided_token` 支持从 payload 读取，建议只保留 Header 通道
+4. **依赖审计**：CI 接入 `pip-audit`；SAST 接入 Bandit（与首轮结论一致）
+5. **快照命名**：`profile_history.py` 快照文件名含画像内 version 字段（rollback 入口已封堵，仅画像被污染时理论可触发）

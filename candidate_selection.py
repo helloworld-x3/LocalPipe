@@ -119,7 +119,9 @@ def build_selection_decision(candidates, threshold=0.7):
     """Select the best eligible candidate and derive uncertainty/review policy."""
     ranked = rank_candidates(candidates, threshold)
     eligible = [candidate for candidate in ranked if candidate["eligible"]]
-    selected = eligible[0] if eligible else (ranked[0] if ranked else None)
+    # A blocked decision has no publishable recommendation. Keep ranked
+    # candidates for diagnosis without presenting a gated route as selected.
+    selected = eligible[0] if eligible else None
 
     if len(eligible) < 2:
         margin = None

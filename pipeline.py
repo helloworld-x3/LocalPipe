@@ -7,6 +7,7 @@ import re
 import sys
 import time
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,15 +35,22 @@ def load_dotenv():
 load_dotenv()
 
 from model import ModelClient, ModelConfig, sanitize_user_input, Cache, Telemetry
+from market_code import validate_market_code
 
 FIDELITY_THRESHOLD = float(os.environ.get("FIDELITY_THRESHOLD", "0.7"))
 MAX_RETRIES = 2
+
+# 三路线并行执行开关（默认关闭以保持串行确定性；开启后单任务 LLM 耗时约降为 1/3）。
+# 三条路线互相独立、无共享可变状态，且全局 RateLimiter 仍限制总请求速率，费用可控。
+# 注意：开启后日志输出顺序不再确定，依赖串行顺序的行为测试应在默认（关闭）下运行。
+PARALLEL_ROUTES = os.environ.get("LOCALPIPE_PARALLEL_ROUTES", "0") == "1"
 
 # 保真回检要素权重（加权保真率）：品牌保护词与产品事实最重，情绪/CTA 次之。
 # 漏一个数字事实比少一个情绪词严重得多——用权重而不是简单平均来衡量。
 _KIND_WEIGHTS = {
     "protected_term": 3,  # 品牌保护词：不可丢
     "selling_point": 2,   # 核心卖点
+    "product_type": 3,    # 产品形态/类别：防止开衫等产品事实漂移
     "emotion_hook": 1,    # 情绪钩子
     "cta": 1,             # 行动号召
 }
@@ -71,7 +79,10 @@ def _make_cache_key(prompt, model, max_tokens, base_url):
 _SCHEMAS = {
     "deconstruct": {
         "required": ["selling_points", "emotion_hook", "target_audience", "cta"],
-        "types": {"selling_points": list, "emotion_hook": str, "target_audience": str, "cta": str},
+        "types": {
+            "selling_points": list, "emotion_hook": str, "target_audience": str, "cta": str,
+            "product_type": str,
+        },
     },
     "recreate": {
         "required": ["copy", "copy_zh", "used_entries", "adaptation_note"],
@@ -254,12 +265,18 @@ def _llm_json(prompt, max_tokens=900, schema=None):
 
 def load_profile(market_code):
     """加载国家文化画像，过滤已过期条目"""
+    market_code = validate_market_code(market_code)
     path = os.path.join(BASE_DIR, "profiles", f"{market_code}.json")
     if not os.path.isfile(path):
-        # 按文件名搜索
+        # 按 market_code 字段搜索（跳过 history 目录与非 JSON 文件）
         for fn in os.listdir(os.path.join(BASE_DIR, "profiles")):
-            with open(os.path.join(BASE_DIR, "profiles", fn), encoding="utf-8") as f:
-                p = json.load(f)
+            if not fn.endswith(".json") or fn.startswith("."):
+                continue
+            try:
+                with open(os.path.join(BASE_DIR, "profiles", fn), encoding="utf-8") as f:
+                    p = json.load(f)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
             if p.get("market_code") == market_code:
                 path = os.path.join(BASE_DIR, "profiles", fn)
                 break
@@ -317,7 +334,8 @@ def deconstruct(source_text):
   "emotion_hook": "情绪钩子（这条文案靠什么情绪打动人）",
   "cultural_refs": ["文案里用到的中文梗/文化引用，没有则空列表"],
   "target_audience": "目标人群",
-  "cta": "行动号召（引导用户做什么）"
+  "cta": "行动号召（引导用户做什么）",
+  "product_type": "产品形态/类别（如针织开衫、连衣裙；无法确认则空字符串）"
 }}"""
     return _llm_json(prompt, max_tokens=500, schema="deconstruct")
 
@@ -337,19 +355,45 @@ def load_brand_context(path=None):
 def brand_rules_text(brand):
     if not brand:
         return ""
-    terms = "\n".join(f"  - 「{t['term']}」: {t['rule']}" for t in brand.get("protected_terms", []))
+
+    def _san(v):
+        v = str(v or "").strip()
+        return sanitize_user_input(v) if v else ""
+
+    terms = "\n".join(
+        f"  - 「{_san(t.get('term', ''))}」: {_san(t.get('rule', ''))}"
+        for t in brand.get("protected_terms", [])
+        if isinstance(t, dict)
+    )
+    brand_name = _san(brand.get("brand_name"))
     return f"""
 【品牌规则（必须遵守）】
-品牌名: {brand.get('brand_name', '')}（{brand.get('brand_name_rule', '保持原样')}）
+品牌名: {brand_name}（{_san(brand.get('brand_name_rule', '保持原样'))}）
 保护术语:
 {terms}
-语气: {brand.get('tone', '')}
-要: {', '.join(brand.get('do', []))}
-不要: {', '.join(brand.get('avoid', []))}
+语气: {_san(brand.get('tone'))}
+要: {', '.join(_san(x) for x in brand.get('do', []))}
+不要: {', '.join(_san(x) for x in brand.get('avoid', []))}
 """
 
 
 # ========== 第二层：画像重创作（带引用追溯） ==========
+
+def _sanitize_elements(value):
+    """递归清洗进入 prompt 的要素文本（防 LLM 解构产物携带注入指令）。
+
+    结构隔离为主：字符串经 sanitize_user_input 包裹进 <user_input> 标签并做
+    HTML 实体转义；dict/list 递归处理，非字符串原样保留。仅用于 prompt 文本，
+    规则计算（_build_expected_checks 等）仍使用原始值。
+    """
+    if isinstance(value, dict):
+        return {key: _sanitize_elements(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_elements(item) for item in value]
+    if isinstance(value, str):
+        return sanitize_user_input(value)
+    return value
+
 
 def _build_creative_routes(elements, profile):
     """Build stable route contracts from source elements and citable profile entries."""
@@ -425,7 +469,7 @@ def recreate(elements, profile, brand=None):
 {brand_text}
 {route_text}
 【创意要素】
-{json.dumps(source_elements, ensure_ascii=False)}
+{json.dumps(_sanitize_elements(source_elements), ensure_ascii=False)}
 
 【{market}文化画像】
 {ctx}
@@ -461,12 +505,12 @@ def fidelity_check(localized_copy, original_elements, brand=None):
 {sanitize_user_input(localized_copy)}
 
 【源创意要素】
-{json.dumps(original_elements, ensure_ascii=False)}
+{json.dumps(_sanitize_elements(original_elements), ensure_ascii=False)}
 
 输出 JSON：
 {{
   "checks": [
-    {{"element": "要素内容", "kind": "selling_point/emotion_hook/cta/protected_term", "recovered": true, "note": "如何体现的，或为什么丢失"}}
+    {{"element": "要素内容", "kind": "selling_point/emotion_hook/cta/product_type/protected_term", "recovered": true, "note": "如何体现的，或为什么丢失"}}
   ],
   "recovery_rate": 0.0
 }}
@@ -541,6 +585,12 @@ def _build_expected_checks(elements, brand=None):
         element = elements.get(kind, "")
         item = (kind, element)
         if element and item not in seen:
+            expected.append(item)
+            seen.add(item)
+    product_type = elements.get("product_type", "")
+    if isinstance(product_type, str) and product_type:
+        item = ("product_type", product_type)
+        if item not in seen:
             expected.append(item)
             seen.add(item)
     if brand and brand.get("protected_terms"):
@@ -784,21 +834,33 @@ def _localize_competitive(source_text, market_code, profile, elements, brand, lo
     from candidate_selection import build_selection_decision
 
     routes = _build_creative_routes(elements, profile)
-    candidates = [
-        _evaluate_route_candidate(source_text, elements, profile, brand, route, log)
-        for route in routes
-    ]
+    if PARALLEL_ROUTES and len(routes) > 1:
+        # 三路线互相独立（_evaluate_route_candidate 只读共享输入，内部使用 dict 副本），
+        # 并行执行后 executor.map 仍按 routes 顺序返回候选，选择逻辑不受影响。
+        with ThreadPoolExecutor(max_workers=len(routes)) as executor:
+            candidates = list(executor.map(
+                lambda route: _evaluate_route_candidate(
+                    source_text, elements, profile, brand, route, log
+                ),
+                routes,
+            ))
+    else:
+        candidates = [
+            _evaluate_route_candidate(source_text, elements, profile, brand, route, log)
+            for route in routes
+        ]
     decision = build_selection_decision(candidates, FIDELITY_THRESHOLD)
     winner = decision["selected"]
+    # Keep the highest-ranked blocked candidate as a diagnostic payload for
+    # legacy top-level fields, while ``selected`` remains None and no route is
+    # exposed as a publishable recommendation.
+    diagnostic_winner = winner or (decision["ranked"][0] if decision["ranked"] else {})
     timings["total_ms"] = round((time.time() - t_start) * 1000)
 
-    if winner is None:
-        final_status = "error"
-        winner = {}
-    elif decision["review_policy"] == "block":
-        final_status = "needs_review" if winner.get("copy") else "error"
+    if not decision["selected"] and decision["review_policy"] == "block":
+        final_status = "needs_review" if diagnostic_winner.get("copy") else "error"
     else:
-        final_status = winner.get("final_status", "needs_review")
+        final_status = diagnostic_winner.get("final_status", "needs_review")
 
     rankings = [
         {
@@ -813,34 +875,46 @@ def _localize_competitive(source_text, market_code, profile, elements, brand, lo
     ]
     selection_trace = {
         "mode": "competitive",
-        "selected_route_id": winner.get("route_id"),
-        "weights": winner.get("weights", {}),
+        "selected_route_id": winner.get("route_id", "") if winner else "",
+        "weights": winner.get("weights", {}) if winner else {},
         "score_margin": decision["uncertainty"]["margin"],
         "rankings": rankings,
     }
+    candidate_errors = []
+    fidelity_retries = 0
+    for candidate in candidates:
+        fidelity_retries += int(candidate.get("fidelity_retries") or 0)
+        candidate_errors.extend(candidate.get("errors") or [])
     _telemetry.log({
         "event": "localize",
         "market": market_code,
         "selection_mode": "competitive",
-        "selected_route_id": winner.get("route_id"),
+        "selected_route_id": winner.get("route_id", "") if winner else "",
         "review_policy": decision["review_policy"],
         "final_status": final_status,
         "timings": timings,
+        "fidelity_retries": fidelity_retries,
+        "errors": candidate_errors,
     })
     return {
         "market": profile["market"],
         "profile_version": profile["version"],
         "source_text": source_text,
-        "elements": elements if winner.get("copy") else None,
-        "copy": winner.get("copy", ""),
-        "copy_zh": winner.get("copy_zh", ""),
-        "adaptation_note": winner.get("adaptation_note", ""),
-        "used_entries": winner.get("used_entries", []),
-        "profile_trace": winner.get("profile_trace", {}),
-        "fidelity": winner.get("fidelity"),
-        "taboo": winner.get("taboo"),
+        # Keep the shared decomposition for Feishu diagnostics even when no
+        # candidate is publishable; candidate-level errors remain in
+        # ``candidates`` and the top-level copy stays empty.
+        "elements": elements if (diagnostic_winner.get("copy") or candidates) else None,
+        # A blocked run has no publishable top-level copy. The diagnostic
+        # candidate remains available under ``candidates`` for Feishu review.
+        "copy": winner.get("copy", "") if winner else "",
+        "copy_zh": winner.get("copy_zh", "") if winner else "",
+        "adaptation_note": winner.get("adaptation_note", "") if winner else "",
+        "used_entries": diagnostic_winner.get("used_entries", []),
+        "profile_trace": diagnostic_winner.get("profile_trace", {}),
+        "fidelity": diagnostic_winner.get("fidelity"),
+        "taboo": diagnostic_winner.get("taboo"),
         "final_status": final_status,
-        "errors": winner.get("errors"),
+        "errors": diagnostic_winner.get("errors"),
         "candidates": decision["ranked"],
         "selection_trace": selection_trace,
         "uncertainty": decision["uncertainty"],
@@ -1059,6 +1133,7 @@ if __name__ == "__main__":
         gen_profile_hashes()
         sys.exit(0)
 
+    args.market = validate_market_code(args.market)
     demo_creative = args.source if args.source else (
         "这个夏天，别让手机先中暑！CoolClip散热背夹，3秒降温15度，"
         "开黑五连坐照样稳如老狗。学生党福音，一杯奶茶钱，游戏体验直接起飞。"

@@ -40,10 +40,10 @@ LocalPipe 增加了三个业务闭环：
 | 异常配对剔除记录 | 已实现 | 批量运行输出 `skipped_*.json` |
 | 市场洞察/创意策略卡 | **初版规则实现** | [`feishu_connector.py`](feishu_connector.py)、[`strategy.py`](strategy.py)；待企业资料校准 |
 | KreadoAI Prompt/JSON适配 | **原型已实现** | [`kreado_adapter.py`](kreado_adapter.py)；待确认官方输入/接口 |
-| 行为测试 | **108 项通过** | [`test_pipeline.py`](test_pipeline.py)，不调用真实 LLM |
+| 行为测试 | **125 项通过** | [`test_pipeline.py`](test_pipeline.py)，不调用真实 LLM |
 | 泰国、日本与跨品类产出存档 | 已有样例 | [`examples/`](examples/) |
 | 法国母语者 A/B 验证 | 3 条广告方案已执行，已收到首份真人反馈；样本不足以得出胜负结论 | [`docs/experiment-design.md`](docs/experiment-design.md) |
-| 飞书多维表格协作闭环 | **API 原型已联调** | 任务读取、结果回写与状态更新已验证；自动触发和妙搭未完成 |
+| 飞书多维表格协作闭环 | **HTTP 自动化原型已联调** | 状态触发、异步执行、三候选回写、系统推荐、审核信息与去重保护已验证；妙搭和正式部署未完成 |
 | 法国 Meta 服饰端到端样板 | **已生成** | [`generate_demo_meta_fr_fashion.py`](generate_demo_meta_fr_fashion.py)、[`outputs/demo_meta_fr_fashion_package.json`](outputs/demo_meta_fr_fashion_package.json)；3 个变体 + C04 风险案例 |
 
 > 说明：自动化测试验证程序规则和异常边界，不等于证明本地化效果优于裸 Prompt。最终效果结论将由母语者盲测给出。
@@ -119,6 +119,8 @@ LLM_API_KEY=your-api-key
 LLM_BASE_URL=https://your-provider.com
 LLM_MODEL=your-model-name
 LOCALPIPE_SELECTION_MODE=competitive
+# 可选：三路线并行执行（默认 0=串行；置 1 单任务约 3 倍提速，速率限制仍生效）
+# LOCALPIPE_PARALLEL_ROUTES=1
 ```
 
 ### 2. 运行
@@ -172,7 +174,7 @@ LocalPipe 负责创译与质量控制，飞书负责跨市场协作和反馈沉�
 → 看板展示进度、质量、跳过率与失败原因
 ```
 
-飞书不是单纯的结果展示页，而是连接品牌方、创意团队、市场审核人与文化知识库的协作中枢。当前已经完成单任务 API 原型联调：读取“待生成”任务、调用 LocalPipe、回写本地化结果与策略包，并将状态更新为“待审核”。连接器仍需手动运行，尚未接入自动触发、妙搭或 KreadoAI 正式 API。
+飞书不是单纯的结果展示页，而是连接品牌方、创意团队、市场审核人与文化知识库的协作中枢。当前已经完成 HTTP 自动化原型联调：任务进入“待生成”后由飞书自动化发送记录 ID，桥接异步调用 LocalPipe，回写三候选、系统推荐、质检信息和三份 KreadoAI Brief，并将状态更新为“待审核”或“异常”。当前仍需本地桥接与 HTTPS 隧道，不等于正式生产部署；尚未接入妙搭或 KreadoAI 正式 API。配置见 [`docs/feishu-automation.md`](docs/feishu-automation.md)。
 
 ## 设计边界
 
@@ -190,10 +192,11 @@ candidate_selection.py      候选硬门控、确定性评分、排序与不确�
 model.py                    OpenAI 兼容模型层、缓存、限流、遥测
 batch.py                    多创意 × 多市场生成与 A/B 盲测文件
 baseline.py                 裸 Prompt 对照组
-test_pipeline.py            108 项离线行为测试
+test_pipeline.py            125 项离线行为测试
 strategy.py                 市场/平台创意策略卡规则骨架
 kreado_adapter.py           KreadoAI Prompt 与结构化 JSON 适配原型
 feishu_connector.py         飞书任务读取、结果回写与状态更新
+feishu_automation.py        飞书自动化 HTTP 桥接、鉴权、异步调度与去重
 quality_framework.py        MQM-inspired 质量分类与发布决策
 language_assets.py          品牌名、保护术语与禁用词资产审计
 creative_matrix.py          DCO-inspired 三路线创意矩阵
@@ -222,12 +225,13 @@ SECURITY.md                 安全审计与能力边界
 - [x] 品牌术语锁定与保真自动打回
 - [x] A/B 严格配对、混排、揭盲和跳过记录
 - [x] 泰国、日本、美国画像 v0.1；韩国备用样板；法国主样板 v0.2
-- [x] 108 项离线行为测试
+- [x] 125 项离线行为测试
 - [x] MQM-inspired 质量报告、语言资产、DCO 创意矩阵与专业创译交付包
 - [x] 市场洞察与创意策略卡原型
 - [x] KreadoAI Prompt/JSON适配原型
 - [x] 飞书多维表格单任务 API 原型联调
-- [ ] 飞书自动触发、妙搭界面和正式部署
+- [x] 飞书自动触发 HTTP 原型联调
+- [ ] 妙搭界面和正式部署
 - [ ] KreadoAI 正式 API 联调
 - [ ] 收齐法国母语者反馈、揭盲统计并回灌评分
 - [ ] 基于母语者反馈校准画像与规则库
