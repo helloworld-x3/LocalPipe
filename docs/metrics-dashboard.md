@@ -60,6 +60,14 @@
 
 **待补**：与人工基线对比的实测记录（找测试者实际计时，不估算）。
 
+飞书真实任务运行后执行：
+
+```text
+python feishu_connector.py --export-metrics outputs/feishu_business_metrics.json
+```
+
+导出只统计审核表中明确填写的配对数据：AI 总耗时、人工审核分钟数、人工从头完成基线分钟数。任一字段缺失，该条不会进入时间节省统计，避免用估算值冒充企业实测。
+
 ## 6. 画像置信度变化
 
 **定义**：画像不是写死的知识库，而是带元数据的可校准证据系统。fr 条目含 `evidence_level`（A 权威源 / B / C 冷启动假设）、`validation_status`、`unverified_claims`、`expires`。

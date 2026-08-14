@@ -18,6 +18,8 @@ import json
 import os
 import threading
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Mapping, Optional
@@ -67,18 +69,43 @@ def provided_token(headers: Mapping[str, str], payload: Any = None) -> str:
 MAX_BODY_BYTES = 64 * 1024
 COMPLETED_TTL = 24 * 3600
 MAX_CONCURRENT_TASKS = 2
+DEFAULT_EVENT_LEDGER = Path(__file__).resolve().parent / ".cache" / "feishu_automation_events.jsonl"
+_EVENT_LOCK = threading.Lock()
+
+
+def append_automation_event(event: Dict[str, Any], path: Optional[Path] = None) -> Path:
+    target = Path(path or os.environ.get("FEISHU_AUTOMATION_LEDGER", DEFAULT_EVENT_LEDGER))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(event)
+    payload.setdefault("created_at", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+    with _EVENT_LOCK:
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    return target
 
 
 class AutomationService:
     """Deduplicating asynchronous dispatcher for automation callbacks."""
 
-    def __init__(self, runner: Optional[Callable[[str], Any]] = None):
+    def __init__(
+        self,
+        runner: Optional[Callable[[str], Any]] = None,
+        event_logger: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ):
+        uses_live_runner = runner is None
         self.runner = runner or (lambda record_id: run_live(task_record_id=record_id))
+        self.event_logger = event_logger or (append_automation_event if uses_live_runner else (lambda event: None))
         self._active = set()
         self._completed: Dict[str, float] = {}
         self._lock = threading.Lock()
         self._semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_TASKS)
         self.last_error: Optional[str] = None
+
+    def _log_event(self, event: Dict[str, Any]) -> None:
+        try:
+            self.event_logger(event)
+        except Exception:
+            pass
 
     def submit(self, record_id: str) -> Dict[str, Any]:
         record_id = str(record_id or "").strip()
@@ -89,20 +116,34 @@ class AutomationService:
             for rid in [r for r, ts in self._completed.items() if now - ts > COMPLETED_TTL]:
                 self._completed.pop(rid, None)
             if record_id in self._active or record_id in self._completed:
+                self._log_event({"event": "duplicate", "record_id": record_id})
                 return {"accepted": True, "status": "duplicate", "record_id": record_id}
             self._active.add(record_id)
+        self._log_event({"event": "queued", "record_id": record_id})
         thread = threading.Thread(target=self._execute, args=(record_id,), daemon=True)
         thread.start()
         return {"accepted": True, "status": "queued", "record_id": record_id}
 
     def _execute(self, record_id: str) -> None:
+        started = time.monotonic()
         try:
             with self._semaphore:
                 self.runner(record_id)
             with self._lock:
                 self._completed[record_id] = time.time()
+            self._log_event({
+                "event": "completed",
+                "record_id": record_id,
+                "duration_ms": round((time.monotonic() - started) * 1000),
+            })
         except Exception as exc:  # pragma: no cover - surfaced through logs/health
             self.last_error = f"{type(exc).__name__}: {exc}"
+            self._log_event({
+                "event": "failed",
+                "record_id": record_id,
+                "duration_ms": round((time.monotonic() - started) * 1000),
+                "error_type": type(exc).__name__,
+            })
         finally:
             with self._lock:
                 self._active.discard(record_id)

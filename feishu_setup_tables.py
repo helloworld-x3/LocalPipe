@@ -41,6 +41,22 @@ REVIEW_FIELDS = [
         {"name": "待归纳"}, {"name": "已归纳"}]}},
     {"field_name": "AI问题归类", "type": 1},
     {"field_name": "AI反馈总结", "type": 1},
+    {"field_name": "候选变体", "type": 1},
+    {"field_name": "系统推荐变体", "type": 1},
+    {"field_name": "推荐理由", "type": 1},
+    {"field_name": "审核策略", "type": 1},
+    {"field_name": "不确定性", "type": 1},
+    {"field_name": "审核状态", "type": 3, "property": {"options": [
+        {"name": "待审核"}, {"name": "已完成"}]}},
+    {"field_name": "修改程度", "type": 3, "property": {"options": [
+        {"name": "直接采纳"}, {"name": "小幅修改"}, {"name": "大幅修改"}, {"name": "废弃"}]}},
+    {"field_name": "采用候选", "type": 1},
+    {"field_name": "是否采纳系统推荐", "type": 7},
+    {"field_name": "人工耗时分钟", "type": 2},
+    {"field_name": "人工基线分钟", "type": 2},
+    {"field_name": "AI总耗时秒", "type": 2},
+    {"field_name": "风险确认", "type": 3, "property": {"options": [
+        {"name": "确认系统风险"}, {"name": "系统误报"}, {"name": "无风险"}]}},
     {"field_name": "审核时间", "type": 5},
 ]
 
@@ -87,6 +103,38 @@ def _create_table(client: FeishuBitableClient, name: str, fields: list) -> str:
     return data.get("data", {}).get("table_id", "")
 
 
+def _missing_field_specs(specs: list, existing_fields: list) -> list:
+    existing_names = {str(item.get("field_name", "")).strip() for item in existing_fields}
+    return [item for item in specs if str(item.get("field_name", "")).strip() not in existing_names]
+
+
+def _list_fields(client: FeishuBitableClient, table_id: str) -> list:
+    data = _request(
+        "GET",
+        f"{FEISHU_BASE_URL}/open-apis/bitable/v1/apps/{client.app_token}/tables/{table_id}/fields?page_size=500",
+        client.tenant_token,
+    )
+    return data.get("data", {}).get("items", [])
+
+
+def _create_field(client: FeishuBitableClient, table_id: str, field: dict) -> str:
+    data = _request(
+        "POST",
+        f"{FEISHU_BASE_URL}/open-apis/bitable/v1/apps/{client.app_token}/tables/{table_id}/fields",
+        client.tenant_token,
+        field,
+    )
+    return data.get("data", {}).get("field", {}).get("field_id", "")
+
+
+def _ensure_fields(client: FeishuBitableClient, table_id: str, fields: list) -> int:
+    missing = _missing_field_specs(fields, _list_fields(client, table_id))
+    for field in missing:
+        _create_field(client, table_id, field)
+        print(f"  新增字段: {field['field_name']}")
+    return len(missing)
+
+
 def _upsert_env(key: str, value: str) -> None:
     lines = []
     if os.path.isfile(ENV_PATH):
@@ -121,7 +169,8 @@ def main() -> int:
     for name, env_key, fields in TABLE_SPECS:
         table_id = existing.get(name, "")
         if table_id:
-            print(f"{name} 已存在: {table_id}，跳过创建")
+            print(f"{name} 已存在: {table_id}，检查增量字段")
+            _ensure_fields(client, table_id, fields)
         else:
             table_id = _create_table(client, name, fields)
             print(f"{name} 已创建: {table_id}")

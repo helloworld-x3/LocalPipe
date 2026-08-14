@@ -824,6 +824,7 @@ class TestBusinessLayers(unittest.TestCase):
             "final_status": "pass", "fidelity": {"recovery_rate": 1.0},
             "taboo": {"risk_level": "low"}, "used_entries": ["fr-001"],
             "profile_version": "v0.2", "profile_trace": {"valid_ids": ["fr-001"]},
+            "timings": {"total_ms": 1500},
         }
         with patch("feishu_connector.append_run_snapshot") as append:
             process_tasks(
@@ -865,6 +866,7 @@ class TestBusinessLayers(unittest.TestCase):
             "final_status": "pass", "fidelity": {"recovery_rate": 1.0},
             "taboo": {"risk_level": "low"}, "used_entries": ["fr-001"],
             "profile_version": "v0.2", "profile_trace": {"valid_ids": ["fr-001"]},
+            "timings": {"total_ms": 1500},
         }
         env = {
             "FEISHU_APP_TOKEN": "app", "FEISHU_TASK_TABLE_ID": "task",
@@ -1652,6 +1654,247 @@ class _FakeBitableClient:
 
 
 class TestFeishuClosedLoop(unittest.TestCase):
+    def test_automation_service_logs_queued_completed_duplicate_and_failed_events(self):
+        import time
+        from feishu_automation import AutomationService
+
+        events = []
+        service = AutomationService(
+            runner=lambda record_id: None,
+            event_logger=lambda event: events.append(event),
+        )
+        self.assertEqual(service.submit("rec-ok")["status"], "queued")
+        for _ in range(100):
+            if any(event.get("event") == "completed" for event in events):
+                break
+            time.sleep(0.001)
+        self.assertEqual(service.submit("rec-ok")["status"], "duplicate")
+        self.assertEqual([event["event"] for event in events], ["queued", "completed", "duplicate"])
+        self.assertGreaterEqual(events[1]["duration_ms"], 0)
+
+        failed_events = []
+        failed = AutomationService(
+            runner=lambda record_id: (_ for _ in ()).throw(RuntimeError("secret detail")),
+            event_logger=lambda event: failed_events.append(event),
+        )
+        failed.submit("rec-fail")
+        for _ in range(100):
+            if any(event.get("event") == "failed" for event in failed_events):
+                break
+            time.sleep(0.001)
+        self.assertEqual([event["event"] for event in failed_events], ["queued", "failed"])
+        self.assertEqual(failed_events[1]["error_type"], "RuntimeError")
+        self.assertNotIn("secret detail", json.dumps(failed_events[1], ensure_ascii=False))
+
+    def test_automation_event_logging_failure_does_not_block_task(self):
+        import time
+        from feishu_automation import AutomationService
+
+        started = []
+        service = AutomationService(
+            runner=lambda record_id: started.append(record_id),
+            event_logger=lambda event: (_ for _ in ()).throw(OSError("ledger unavailable")),
+        )
+        self.assertEqual(service.submit("rec-log-fail")["status"], "queued")
+        for _ in range(100):
+            if started:
+                break
+            time.sleep(0.001)
+        self.assertEqual(started, ["rec-log-fail"])
+
+    def test_injected_automation_runner_does_not_write_default_business_ledger(self):
+        import time
+        from feishu_automation import AutomationService
+
+        with patch("feishu_automation.append_automation_event") as append:
+            service = AutomationService(runner=lambda record_id: None)
+            service.submit("rec-test-only")
+            for _ in range(100):
+                if "rec-test-only" in service._completed:
+                    break
+                time.sleep(0.001)
+        append.assert_not_called()
+
+    def test_metrics_include_automation_event_counts(self):
+        from feishu_metrics import summarize_feishu_business_metrics
+
+        events = [
+            {"event": "queued", "record_id": "r1"},
+            {"event": "completed", "record_id": "r1", "duration_ms": 1000},
+            {"event": "queued", "record_id": "r2"},
+            {"event": "failed", "record_id": "r2", "duration_ms": 300},
+            {"event": "duplicate", "record_id": "r1"},
+        ]
+        metrics = summarize_feishu_business_metrics([], [], [], automation_events=events)
+        self.assertEqual(metrics["automation"]["queued"], 2)
+        self.assertEqual(metrics["automation"]["completed"], 1)
+        self.assertEqual(metrics["automation"]["failed"], 1)
+        self.assertEqual(metrics["automation"]["duplicates_blocked"], 1)
+        self.assertEqual(metrics["automation"]["completion_rate"], 0.5)
+        self.assertEqual(metrics["automation"]["median_duration_seconds"], 0.65)
+
+    def test_export_feishu_metrics_reads_all_workflow_tables_and_event_ledger(self):
+        from feishu_connector import export_feishu_metrics
+
+        class FakeClient(_FakeBitableClient):
+            def list_tasks(self):
+                return [{"record_id": "task-1", "fields": {"任务ID": "T1", "状态": "待审核"}}]
+
+            def list_outputs(self):
+                return [{"record_id": "out-1", "fields": {"任务ID": "T1", "系统状态": "pass"}}]
+
+        client = FakeClient()
+        client._tables["review"] = [{"record_id": "rv-1", "fields": {
+            "任务ID": "T1", "审核状态": "已完成", "修改程度": "直接采纳",
+        }}]
+        client._tables["revision"] = [{"record_id": "rev-1", "fields": {"状态": "待确认"}}]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_path = Path(temp_dir) / "events.jsonl"
+            event_path.write_text(
+                json.dumps({"event": "queued", "record_id": "task-1"}, ensure_ascii=False) + "\n" +
+                json.dumps({"event": "completed", "record_id": "task-1", "duration_ms": 900}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            report_path = Path(temp_dir) / "metrics.json"
+            metrics = export_feishu_metrics(client, report_path, event_path)
+            saved = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(metrics["workflow"]["tasks"], 1)
+        self.assertEqual(metrics["workflow"]["outputs"], 1)
+        self.assertEqual(metrics["review"]["completed"], 1)
+        self.assertEqual(metrics["feedback"]["revision_candidates"], 1)
+        self.assertEqual(metrics["automation"]["completed"], 1)
+        self.assertEqual(saved["schema_version"], "feishu-business-metrics-v1")
+
+    def test_missing_field_specs_preserve_existing_and_return_only_new_fields(self):
+        from feishu_setup_tables import _missing_field_specs
+
+        specs = [
+            {"field_name": "任务ID", "type": 1},
+            {"field_name": "审核状态", "type": 3},
+            {"field_name": "人工耗时分钟", "type": 2},
+        ]
+        missing = _missing_field_specs(specs, [{"field_name": "任务ID"}])
+        self.assertEqual([item["field_name"] for item in missing], ["审核状态", "人工耗时分钟"])
+
+    def test_ensure_review_record_carries_candidate_context_and_is_idempotent(self):
+        from feishu_connector import ensure_review_record
+
+        client = _FakeBitableClient()
+        output_fields = {
+            "任务ID": "T-FR-001",
+            "目标市场": "fr",
+            "画像条目": "fr-001, fr-002",
+            "候选变体": json.dumps([
+                {"variant_id": "product_proof", "score": 0.82, "eligible": True},
+                {"variant_id": "scene_fit", "score": 0.79, "eligible": True},
+                {"variant_id": "brand_emotion", "score": 0.71, "eligible": False},
+            ], ensure_ascii=False),
+            "系统推荐变体": "product_proof",
+            "推荐理由": "通过硬门禁；得分 0.8200；排名第 1",
+            "审核策略": "sample",
+            "不确定性": json.dumps({"level": "low", "margin": 0.03}, ensure_ascii=False),
+        }
+
+        review_id = ensure_review_record(client, "out-001", output_fields)
+        self.assertTrue(review_id)
+        review = client._tables["review"][0]["fields"]
+        self.assertEqual(review["产出ID"], "out-001")
+        self.assertEqual(review["候选变体"], output_fields["候选变体"])
+        self.assertEqual(review["系统推荐变体"], "product_proof")
+        self.assertEqual(review["推荐理由"], output_fields["推荐理由"])
+        self.assertEqual(review["审核策略"], "sample")
+        self.assertEqual(review["不确定性"], output_fields["不确定性"])
+        self.assertEqual(review["审核状态"], "待审核")
+        self.assertEqual(ensure_review_record(client, "out-001", output_fields), review_id)
+        self.assertEqual(len(client._tables["review"]), 1)
+
+    def test_review_fields_omit_missing_numeric_ai_duration(self):
+        from feishu_connector import _review_fields
+
+        fields = _review_fields("out-old", {"任务ID": "T-old", "目标市场": "fr"})
+        self.assertNotIn("AI总耗时秒", fields)
+
+    def test_process_one_task_automatically_creates_review_record(self):
+        import feishu_connector
+        from task_checkpoints import CheckpointStore
+
+        class FakeClient(_FakeBitableClient):
+            def __init__(self):
+                super().__init__()
+                self.task_table = "task"
+                self.app_token = "app"
+                self.updated_tasks = []
+
+            def update_task(self, record_id, fields):
+                self.updated_tasks.append((record_id, fields))
+
+            def create_output(self, fields):
+                return self.create_record(self.output_table, fields, self.output_app_token)
+
+        task = {"record_id": "task-rec", "fields": {
+            "任务ID": "T-AUTO-REVIEW", "中文原文": "柔软针织", "目标市场": "fr",
+            "平台": "Meta", "产品品类": "服饰", "状态": "待生成",
+        }}
+        result = {
+            "copy": "Une maille douce.", "copy_zh": "柔软针织。",
+            "elements": {"selling_points": ["柔软针织"], "cta": "了解更多"},
+            "final_status": "pass", "fidelity": {"recovery_rate": 1.0},
+            "taboo": {"risk_level": "low"}, "used_entries": ["fr-001"],
+            "profile_version": "v0.2", "profile_trace": {"valid_ids": ["fr-001"]},
+            "timings": {"total_ms": 1500},
+        }
+        client = FakeClient()
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(feishu_connector, "localize", return_value=result), \
+             patch.object(feishu_connector, "append_run_snapshot"):
+            store = CheckpointStore(Path(temp_dir) / "checkpoints.json")
+            feishu_connector._process_one_task(client, store, task, existing=None)
+
+        self.assertEqual(len(client._tables["output"]), 1)
+        self.assertEqual(len(client._tables["review"]), 1)
+        self.assertEqual(client._tables["review"][0]["fields"]["任务ID"], "T-AUTO-REVIEW")
+        self.assertGreaterEqual(client._tables["review"][0]["fields"]["AI总耗时秒"], 0.0)
+
+    def test_feishu_business_metrics_only_use_explicit_paired_data(self):
+        from feishu_metrics import summarize_feishu_business_metrics
+
+        reviews = [
+            {"fields": {
+                "任务ID": "T1", "采用意见": "通过", "修改程度": "直接采纳",
+                "是否采纳系统推荐": True, "人工耗时分钟": 4, "人工基线分钟": 25,
+                "AI总耗时秒": 60,
+                "风险确认": "确认系统风险", "审核状态": "已完成",
+            }},
+            {"fields": {
+                "任务ID": "T2", "采用意见": "修改后通过", "修改程度": "小幅修改",
+                "是否采纳系统推荐": False, "人工耗时分钟": 9, "人工基线分钟": 30,
+                "AI总耗时秒": 120,
+                "风险确认": "无风险", "审核状态": "已完成",
+            }},
+            {"fields": {
+                "任务ID": "T3", "采用意见": "不通过", "修改程度": "废弃",
+                "审核状态": "已完成",
+            }},
+            {"fields": {"任务ID": "T4", "审核状态": "待审核"}},
+        ]
+
+        metrics = summarize_feishu_business_metrics([], reviews, [])
+        self.assertEqual(metrics["review"]["completed"], 3)
+        self.assertEqual(metrics["review"]["outcomes"], {
+            "直接采纳": 1, "小幅修改": 1, "大幅修改": 0, "废弃": 1,
+        })
+        self.assertEqual(metrics["recommendation"]["evaluated"], 2)
+        self.assertEqual(metrics["recommendation"]["adopted"], 1)
+        self.assertEqual(metrics["recommendation"]["adoption_rate"], 0.5)
+        self.assertEqual(metrics["efficiency"]["paired_samples"], 2)
+        self.assertEqual(metrics["efficiency"]["median_human_review_minutes"], 6.5)
+        self.assertEqual(metrics["efficiency"]["median_ai_minutes"], 1.5)
+        self.assertEqual(metrics["efficiency"]["median_manual_baseline_minutes"], 27.5)
+        self.assertEqual(metrics["efficiency"]["median_minutes_saved"], 19.5)
+        self.assertEqual(metrics["risk"]["human_confirmed"], 1)
+
     def test_brand_rules_sanitize_brand_name_and_protected_term(self):
         from pipeline import brand_rules_text
 
@@ -2052,6 +2295,34 @@ class TestFeishuClosedLoop(unittest.TestCase):
             self.assertIn("rv-001", c["fields"]["引用审核记录"])
             self.assertIn("rv-002", c["fields"]["引用审核记录"])
         self.assertEqual({c["fields"]["动作"] for c in cands}, {"新增", "修改"})
+
+    def test_summarize_reviews_skips_new_review_task_until_human_completes_it(self):
+        from feishu_connector import summarize_reviews
+
+        client = _FakeBitableClient()
+        client._tables["review"] = [
+            {"record_id": "rv-pending", "fields": {
+                "审核记录ID": "rv-pending", "目标市场": "fr",
+                "审核状态": "待审核", "归纳状态": "待归纳",
+            }},
+            {"record_id": "rv-done", "fields": {
+                "审核记录ID": "rv-done", "目标市场": "fr",
+                "审核状态": "已完成", "归纳状态": "待归纳",
+                "采用意见": "修改后通过", "修改建议": "保留产品类别",
+            }},
+        ]
+        calls = []
+
+        def runner(reviews, market_code):
+            calls.append((reviews, market_code))
+            return {"problem_categories": [], "feedback_summary": "已审核", "revision_candidates": []}
+
+        self.assertEqual(summarize_reviews(client, runner=runner), 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0][0]), 1)
+        statuses = {row["record_id"]: row["fields"]["归纳状态"] for row in client._tables["review"]}
+        self.assertEqual(statuses["rv-pending"], "待归纳")
+        self.assertEqual(statuses["rv-done"], "已归纳")
 
     def test_summarize_reviews_empty_candidates(self):
         from feishu_connector import summarize_reviews

@@ -18,6 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -37,6 +38,7 @@ from review_ai import (  # noqa: E402
     summarize_feedback,
 )
 from run_ledger import append_run_snapshot, build_run_snapshot  # noqa: E402
+from feishu_metrics import summarize_feishu_business_metrics, write_metrics_report  # noqa: E402
 from profile_history import ProfileHistory, rollback_profile  # noqa: E402
 from strategy import build_strategy  # noqa: E402
 from task_checkpoints import CheckpointStore  # noqa: E402
@@ -542,6 +544,69 @@ def _output_task_id(record: Dict[str, Any]) -> str:
     return str(_field(record, FIELD_TASK_ID, "") or _field(record, "task_id", "")).strip()
 
 
+def _review_fields(output_record_id: str, output_fields: Dict[str, Any]) -> Dict[str, Any]:
+    fields = {
+        "产出ID": str(output_record_id or "").strip(),
+        "任务ID": str(_field(output_fields, "任务ID", "")).strip(),
+        "目标市场": str(_field(output_fields, "目标市场", "")).strip(),
+        "涉及画像条目": str(_field(output_fields, "画像条目", "")).strip(),
+        "候选变体": str(_field(output_fields, "候选变体", "")).strip(),
+        "系统推荐变体": str(_field(output_fields, "系统推荐变体", "")).strip(),
+        "推荐理由": str(_field(output_fields, "推荐理由", "")).strip(),
+        "审核策略": str(_field(output_fields, "审核策略", "")).strip(),
+        "不确定性": str(_field(output_fields, "不确定性", "")).strip(),
+        "审核状态": "待审核",
+        "归纳状态": "待归纳",
+        "审核时间": int(time.time() * 1000),
+    }
+    ai_total_seconds = _field(output_fields, "AI总耗时秒", "")
+    if ai_total_seconds not in (None, ""):
+        fields["AI总耗时秒"] = ai_total_seconds
+    return fields
+
+
+def _review_source_fields(
+    output_fields: Dict[str, Any], run_snapshot: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    review_fields = dict(output_fields)
+    ai_total_seconds = (run_snapshot or {}).get("ai_total_seconds")
+    if ai_total_seconds not in (None, ""):
+        review_fields["AI总耗时秒"] = ai_total_seconds
+    return review_fields
+
+
+def ensure_review_record(
+    client: FeishuBitableClient,
+    output_record_id: str,
+    output_fields: Dict[str, Any],
+    existing_reviews: Optional[Iterable[Dict[str, Any]]] = None,
+) -> str:
+    """Create one review task per output and return the review record ID."""
+    review_table = getattr(client, "review_table", "")
+    if not review_table:
+        return ""
+    review_app_token = getattr(client, "review_app_token", None)
+    reviews = list(existing_reviews) if existing_reviews is not None else client.list_records(
+        review_table, review_app_token
+    )
+    for review in reviews:
+        if str(_field(review, "产出ID", "")).strip() == str(output_record_id or "").strip():
+            return str(review.get("record_id", "")).strip()
+    new_id = client.create_record(
+        review_table,
+        _review_fields(output_record_id, output_fields),
+        review_app_token,
+    )
+    if new_id:
+        client.update_record(
+            review_table,
+            new_id,
+            {"审核记录ID": new_id},
+            review_app_token,
+        )
+    return new_id
+
+
 def _process_one_task(
     client: FeishuBitableClient,
     checkpoint_store: CheckpointStore,
@@ -550,6 +615,11 @@ def _process_one_task(
 ) -> Optional[Dict[str, Any]]:
     checkpoint = checkpoint_store.load(task)
     if existing:
+        ensure_review_record(
+            client,
+            str(existing.get("record_id", "")),
+            _review_source_fields(existing.get("fields", existing), (checkpoint or {}).get("run_snapshot")),
+        )
         if checkpoint and not checkpoint.get("output_written"):
             checkpoint_store.mark_output_written(task, str(existing.get("record_id", "")))
         output_status = str(_field(existing, "系统状态", "")).strip().lower()
@@ -558,6 +628,11 @@ def _process_one_task(
 
     if checkpoint and checkpoint.get("output_written"):
         result = checkpoint.get("result") or {"final_status": "error"}
+        ensure_review_record(
+            client,
+            str(checkpoint.get("output_record_id", "")),
+            _review_source_fields(checkpoint.get("fields") or {}, checkpoint.get("run_snapshot")),
+        )
         client.update_task(task["record_id"], {FIELD_STATUS: _task_result_status(result)})
         return
 
@@ -567,6 +642,7 @@ def _process_one_task(
         run_snapshot = checkpoint.get("run_snapshot") or {}
     else:
         client.update_task(task["record_id"], {FIELD_STATUS: "生成中"})
+        generation_started = time.monotonic()
         result = localize(
             str(_field(task, FIELD_SOURCE)).strip(),
             str(_field(task, FIELD_MARKET)).strip(),
@@ -579,11 +655,13 @@ def _process_one_task(
             package = build_creative_package(task, result)
             _merge_package_fields(fields, package)
             run_snapshot = package["run_snapshot"]
+        run_snapshot["ai_total_seconds"] = round(time.monotonic() - generation_started, 3)
         checkpoint = checkpoint_store.save_generated(task, result, fields, run_snapshot=run_snapshot)
 
     output_record_id = client.create_output(fields)
     checkpoint_store.mark_output_written(task, output_record_id)
-    if run_snapshot:
+    ensure_review_record(client, output_record_id, _review_source_fields(fields, run_snapshot))
+    if run_snapshot.get("schema_version"):
         append_run_snapshot(run_snapshot)
     return result
 
@@ -674,10 +752,8 @@ def sync_reviews(client: FeishuBitableClient, market: Optional[str] = None) -> i
     """结果表中待审核/已审核的产出行 → 幂等写入审核表（状态"待归纳"）。"""
     if not client.review_table:
         raise RuntimeError("缺少 FEISHU_REVIEW_TABLE_ID 审核表配置")
-    existing = {
-        str(_field(r, "产出ID", "")).strip()
-        for r in client.list_records(client.review_table, client.review_app_token)
-    }
+    existing_reviews = client.list_records(client.review_table, client.review_app_token)
+    existing = {str(_field(r, "产出ID", "")).strip() for r in existing_reviews}
     created = 0
     for out in client.list_records(client.output_table, client.output_app_token):
         if str(_field(out, "系统状态", "")).strip() not in ("pass", "needs_review"):
@@ -688,18 +764,10 @@ def sync_reviews(client: FeishuBitableClient, market: Optional[str] = None) -> i
         m = str(_field(out, "目标市场", "")).strip()
         if market and m.lower() != market.lower():
             continue
-        new_id = client.create_record(client.review_table, {
-            "产出ID": out_id,
-            "任务ID": str(_field(out, "任务ID", "")).strip(),
-            "目标市场": m,
-            "涉及画像条目": str(_field(out, "画像条目", "")).strip(),
-            "归纳状态": "待归纳",
-            "审核时间": int(time.time() * 1000),
-        }, client.review_app_token)
+        new_id = ensure_review_record(client, out_id, out.get("fields", out), existing_reviews)
         if new_id:
-            client.update_record(
-                client.review_table, new_id, {"审核记录ID": new_id}, client.review_app_token
-            )
+            existing.add(out_id)
+            existing_reviews.append({"record_id": new_id, "fields": {"产出ID": out_id}})
             created += 1
     print(f"审核同步完成：新建 {created} 条审核记录")
     return created
@@ -717,6 +785,7 @@ def summarize_reviews(
     pending = [
         r for r in client.list_records(client.review_table, client.review_app_token)
         if str(_field(r, "归纳状态", "")).strip() == "待归纳"
+        if str(_field(r, "审核状态", "")).strip() in ("", "已完成")
     ]
     if market:
         pending = [r for r in pending if str(_field(r, "目标市场", "")).strip().lower() == market.lower()]
@@ -802,15 +871,70 @@ def rollback_profile_version(market: str, version: str) -> Dict[str, Any]:
     return restored
 
 
+def _read_jsonl(path: Path | str) -> List[Dict[str, Any]]:
+    target = Path(path)
+    if not target.is_file():
+        return []
+    rows = []
+    for line in target.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            rows.append(value)
+    return rows
+
+
+def export_feishu_metrics(
+    client: FeishuBitableClient,
+    report_path: Path | str = "outputs/feishu_business_metrics.json",
+    event_path: Optional[Path | str] = None,
+) -> Dict[str, Any]:
+    """Export a reproducible evidence snapshot from Feishu and local events."""
+    events = _read_jsonl(
+        event_path or os.environ.get(
+            "FEISHU_AUTOMATION_LEDGER",
+            os.path.join(BASE_DIR, ".cache", "feishu_automation_events.jsonl"),
+        )
+    )
+    reviews = (
+        client.list_records(client.review_table, client.review_app_token)
+        if getattr(client, "review_table", "") else []
+    )
+    revisions = (
+        client.list_records(client.revision_table, client.revision_app_token)
+        if getattr(client, "revision_table", "") else []
+    )
+    metrics = summarize_feishu_business_metrics(
+        client.list_tasks(),
+        reviews,
+        revisions,
+        outputs=client.list_outputs(),
+        automation_events=events,
+    )
+    write_metrics_report(metrics, report_path)
+    return metrics
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="飞书 Bitable ↔ LocalPipe 全链路闭环")
     parser.add_argument("--sync-reviews", action="store_true", help="结果表待审核产出 → 写审核表")
     parser.add_argument("--summarize-reviews", action="store_true", help="审核反馈 → LLM 归纳 → 修订候选")
     parser.add_argument("--apply-revisions", action="store_true", help="已采纳候选 → 回灌画像")
+    parser.add_argument(
+        "--export-metrics",
+        nargs="?",
+        const="outputs/feishu_business_metrics.json",
+        default="",
+        help="导出飞书业务指标 JSON，可选指定输出路径",
+    )
     parser.add_argument("--rollback-profile", default="", help="回滚画像市场版本，例如 fr:v0.2")
     parser.add_argument("--market", default="", help="限定目标市场（小写代码，如 kr）")
     args = parser.parse_args()
-    if not any((args.sync_reviews, args.summarize_reviews, args.apply_revisions, args.rollback_profile)):
+    if not any((args.sync_reviews, args.summarize_reviews, args.apply_revisions, args.rollback_profile, args.export_metrics)):
         return run_live()
     if args.rollback_profile:
         if ":" not in args.rollback_profile:
@@ -826,6 +950,10 @@ def main() -> int:
         summarize_reviews(client, market)
     if args.apply_revisions:
         apply_revisions(client, market)
+    if args.export_metrics:
+        target = args.export_metrics
+        metrics = export_feishu_metrics(client, target)
+        print(f"飞书业务指标已导出: {target}（完成审核 {metrics['review']['completed']} 条）")
     return 0
 
 

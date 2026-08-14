@@ -84,11 +84,13 @@ cpolar 步骤：注册 → 安装 → `cpolar http 8080` → 复制输出的 htt
 4. ✅ 观察桥接终端：出现 `[feishu-automation] ... POST /trigger` 与 LocalPipe 生成日志
 5. ✅ 任务表状态流转：`待生成 → 生成中 → 待审核`（失败则 `异常`）
 6. ✅ 结果表出现新记录：本地化文案 / 中文回译 / 卖点保真率 / 禁忌风险 等字段已回写
-7. ✅ 审核闭环（手动命令，见 `docs/feishu-integration-mvp.md`）：
+7. ✅ 结果写回后自动创建一条审核任务，审核表可查看三候选、系统推荐与质检上下文
+8. ✅ 人工完成审核后，执行反馈归纳、修订采纳和指标导出（见 `docs/feishu-integration-mvp.md`）：
    ```bat
-   python feishu_connector.py --sync-reviews       :: 结果表产出 → 审核表(待归纳)
+   python feishu_connector.py --sync-reviews       :: 仅用于补建历史或漏建的审核任务
    python feishu_connector.py --summarize-reviews  :: 审核反馈 → LLM 归纳 + 修订候选(待确认)
    python feishu_connector.py --apply-revisions    :: 已采纳候选 → 原子回灌画像
+   python feishu_connector.py --export-metrics outputs/feishu_business_metrics.json
    ```
 
 ## 六、故障排查
@@ -100,7 +102,7 @@ cpolar 步骤：注册 → 安装 → `cpolar http 8080` → 复制输出的 htt
 | 桥接返回 401 | token 不匹配 | Header 名必须是 `X-LocalPipe-Token`（也兼容 X-Feishu-Token/X-Webhook-Token/Authorization Bearer）；值必须与 .env 一致 |
 | 桥接返回 413 | 请求体超 64KB | 正常不会触发；检查自动化流程 body 模板是否把整条记录塞进去了（只需 record_id） |
 | 触发但任务没生成 | 状态不是"待生成" | `run_live` 只处理 `待生成/生成中`；检查任务表状态字段名是否与 `FEISHU_FIELD_STATUS` 一致（默认"状态"） |
-| 生成失败（状态=异常） | 缺画像文件/LLM 报错 | 看桥接日志；`profiles/th|jp|us.json` 目前缺失，法国用 `fr` |
+| 生成失败（状态=异常） | 画像或 LLM 报错 | 看桥接日志；法国主样板使用 `fr` |
 | 重复触发刷费用 | 去重窗口外重复推送 | 代码有 24h 去重；若需更严，触发条件收紧 |
 
 ## 七、安全提示（重要）
