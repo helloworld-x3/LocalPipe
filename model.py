@@ -6,7 +6,6 @@ import re
 import sys
 import json
 import time
-import hashlib
 import threading
 import warnings
 

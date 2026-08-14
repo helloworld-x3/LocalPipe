@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -134,10 +134,3 @@ def load_profile_summary(
         "confidence": confidence,
         "expired_ids": list(profile.get("_expired_ids", [])),
     }
-
-
-def evidence_text(summary: Optional[Dict[str, Any]]) -> str:
-    """Compact evidence text for prompts and audit displays."""
-    if not summary:
-        return "无画像证据"
-    return "；".join(f"[{item['id']}] {item['content']}" for item in summary.get("evidence", []))

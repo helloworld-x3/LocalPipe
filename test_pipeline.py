@@ -726,7 +726,6 @@ class TestBatchArtifacts(unittest.TestCase):
             source = root / "creatives.json"
             source.write_text(json.dumps([{"id": "C01", "text": "文案"}], ensure_ascii=False), encoding="utf-8")
             with patch.object(batch, "BASE_DIR", str(root)), \
-                 patch("batch.load_brand_context", return_value=None), \
                  patch("batch.localize", return_value={"copy": "", "final_status": "error"}), \
                  patch("batch.localize_baseline", return_value={"copy": "A"}), \
                  patch("batch.random.shuffle", side_effect=lambda items: None):

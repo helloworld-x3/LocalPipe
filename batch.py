@@ -11,14 +11,13 @@ import json
 import os
 import random
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
-from pipeline import localize, load_brand_context, load_dotenv
+from pipeline import localize, load_dotenv
 from baseline import localize_baseline
 
 load_dotenv()

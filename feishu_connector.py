@@ -39,7 +39,7 @@ from review_ai import (  # noqa: E402
 )
 from run_ledger import append_run_snapshot, build_run_snapshot  # noqa: E402
 from feishu_metrics import summarize_feishu_business_metrics, write_metrics_report  # noqa: E402
-from profile_history import ProfileHistory, rollback_profile  # noqa: E402
+from profile_history import rollback_profile  # noqa: E402
 from strategy import build_strategy  # noqa: E402
 from task_checkpoints import CheckpointStore  # noqa: E402
 from transcreation_delivery import build_transcreation_delivery  # noqa: E402
@@ -50,20 +50,6 @@ FIELD_SOURCE = os.environ.get("FEISHU_FIELD_SOURCE", "中文原文")
 FIELD_MARKET = os.environ.get("FEISHU_FIELD_MARKET", "目标市场")
 FIELD_STATUS = os.environ.get("FEISHU_FIELD_STATUS", "状态")
 FIELD_TASK_ID = os.environ.get("FEISHU_FIELD_TASK_ID", "任务ID")
-
-OUTPUT_FIELDS = [
-    "任务ID", "目标市场", "本地化文案", "中文回译", "市场机会摘要", "目标受众痛点",
-    "平台内容偏好", "本地化创意方向", "创意策略", "下游素材Brief", "KreadoAI Prompt",
-    "KreadoAI JSON", "卖点保真率", "禁忌风险", "系统状态", "画像条目", "画像版本",
-    "适配说明", "文化风险提示", "调研依据", "洞察置信度", "错误信息", "生成时间",
-    "证据等级", "证据明细", "来源URL", "画像校准状态", "未核验声明",
-    # Competitive-mode additive fields.  Existing bases can add these columns
-    # without changing the legacy output columns above.
-    "候选变体数", "候选变体", "系统推荐变体", "推荐分数", "推荐排名", "推荐理由",
-    "审核策略", "不确定性", "候选选择决策",
-    "KreadoAI Brief 1", "KreadoAI Brief 2", "KreadoAI Brief 3",
-]
-
 
 def _request(method: str, url: str, token: Optional[str] = None, body: Any = None) -> Dict[str, Any]:
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -275,10 +261,6 @@ def build_output(task: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]
         "错误信息": "; ".join(result.get("errors") or []),
         "生成时间": int(datetime.now(timezone.utc).timestamp() * 1000),
     }
-
-
-build_output_fields = build_output
-
 
 def build_market_insight(task: Dict[str, Any]) -> Dict[str, Any]:
     market = str(_field(task, FIELD_MARKET, "")).strip().lower()
