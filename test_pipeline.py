@@ -1745,6 +1745,119 @@ class TestFeishuClosedLoop(unittest.TestCase):
         self.assertEqual(json.loads(fields["保真检查"])["checks"][0]["recovered"], True)
         self.assertEqual(json.loads(fields["画像追溯"])["valid_ids"], ["fr-001", "fr-002"])
 
+    def test_query_task_summary_returns_candidates_recommendation_and_review_context(self):
+        from feishu_connector import query_task_summary
+
+        class QueryClient(_FakeBitableClient):
+            def __init__(self):
+                super().__init__()
+                self.task_table = "task"
+                self.app_token = "app"
+
+            def list_tasks(self):
+                return self.list_records(self.task_table, self.app_token)
+
+            def list_outputs(self):
+                return self.list_records(self.output_table, self.output_app_token)
+
+        client = QueryClient()
+        client._tables[client.task_table] = [{"record_id": "task-rec", "fields": {
+            "任务ID": "A-QUERY-001", "目标市场": "fr", "状态": "待审核", "当前阶段": "待人工审核",
+        }}]
+        raw_candidates = [
+            {
+                "variant_id": "scene_fit", "variant_label": "场景适配", "copy": "Une maille douce.",
+                "copy_zh": "柔软针织。", "fidelity": {"checks": [{"kind": "product_type", "recovered": True}]},
+                "taboo": {"risk_level": "low", "reasons": []},
+                "profile_trace": {"valid_ids": ["fr-001"]}, "score": 0.91, "rank": 1,
+                "eligible": True, "hard_gate_reasons": [],
+                "kreado_brief": {"prompt": "scene prompt", "json": {"duration": 15}},
+            },
+            {
+                "variant_id": "product_proof", "variant_label": "产品证明", "copy": "Un cardigan léger.",
+                "copy_zh": "轻盈开衫。", "fidelity": {"checks": []},
+                "taboo": {"risk_level": "medium", "reasons": ["需人工复核"]},
+                "profile_trace": {"valid_ids": ["fr-002"]}, "score": 0.84, "rank": 2,
+                "eligible": False, "hard_gate_reasons": ["taboo_medium"],
+                "kreado_brief": {"prompt": "proof prompt", "json": {"duration": 15}},
+            },
+        ]
+        client._tables[client.output_table] = [{"record_id": "out-rec", "fields": {
+            "任务ID": "A-QUERY-001", "目标市场": "fr", "系统状态": "needs_review",
+            "候选变体数": 2, "候选变体": json.dumps(raw_candidates, ensure_ascii=False),
+            "系统推荐变体": "scene_fit", "推荐分数": "0.91", "推荐排名": "1",
+            "推荐理由": "通过硬门禁；得分 0.9100；排名第 1", "审核策略": "mandatory",
+            "不确定性": json.dumps({"level": "medium", "margin": 0.07}, ensure_ascii=False),
+            "三候选业务摘要": "1. 场景适配｜得分 0.9100｜系统推荐",
+            "下一步操作": "请人工审核",
+        }}]
+        client._tables[client.review_table] = [{"record_id": "review-rec", "fields": {
+            "产出ID": "out-rec", "任务ID": "A-QUERY-001", "审核状态": "待审核",
+            "飞书任务链接": "https://applink.feishu.cn/task/review-1",
+        }}]
+
+        summary = query_task_summary(client, "A-QUERY-001")
+
+        self.assertEqual(summary["task_status"], "待审核")
+        self.assertEqual(summary["current_stage"], "待人工审核")
+        self.assertEqual(summary["candidate_count"], 2)
+        self.assertEqual(summary["recommended_route"], "scene_fit")
+        self.assertEqual(summary["recommendation_score"], 0.91)
+        self.assertEqual(summary["recommendation_rank"], 1)
+        self.assertEqual(summary["review_status"], "待审核")
+        self.assertEqual(summary["review_task_url"], "https://applink.feishu.cn/task/review-1")
+        self.assertEqual(summary["candidates"][0]["fidelity"]["checks"][0]["recovered"], True)
+        self.assertEqual(summary["candidates"][1]["taboo"]["risk_level"], "medium")
+        self.assertEqual(summary["candidates"][1]["profile_trace"]["valid_ids"], ["fr-002"])
+        self.assertEqual(summary["candidates"][1]["hard_gate_reasons"], ["taboo_medium"])
+        self.assertEqual(summary["candidates"][0]["kreado_prompt"], "scene prompt")
+
+    def test_query_task_summary_falls_back_to_output_json_without_candidate_table(self):
+        from feishu_connector import query_task_summary
+
+        class QueryClient(_FakeBitableClient):
+            def __init__(self):
+                super().__init__(candidate_table="")
+                self.task_table = "task"
+                self.app_token = "app"
+
+            def list_tasks(self):
+                return self.list_records(self.task_table, self.app_token)
+
+            def list_outputs(self):
+                return self.list_records(self.output_table, self.output_app_token)
+
+        client = QueryClient()
+        client._tables[client.task_table] = [{"record_id": "task-rec", "fields": {
+            "任务ID": "A-QUERY-FALLBACK", "状态": "待审核",
+        }}]
+        client._tables[client.output_table] = [{"record_id": "out-rec", "fields": {
+            "任务ID": "A-QUERY-FALLBACK", "候选变体": json.dumps([{
+                "variant_id": "product_proof", "variant_label": "产品证明", "score": 0.8,
+                "rank": 1, "eligible": True, "fidelity": {}, "taboo": {}, "profile_trace": {},
+                "hard_gate_reasons": [],
+            }], ensure_ascii=False), "系统推荐变体": "product_proof",
+        }}]
+
+        summary = query_task_summary(client, "A-QUERY-FALLBACK")
+
+        self.assertEqual(summary["candidate_count"], 1)
+        self.assertEqual(summary["candidates"][0]["route"], "product_proof")
+        self.assertTrue(summary["candidates"][0]["eligible"])
+
+    def test_query_task_summary_raises_lookup_error_for_unknown_task(self):
+        from feishu_connector import query_task_summary
+
+        class EmptyClient(_FakeBitableClient):
+            def list_tasks(self):
+                return []
+
+            def list_outputs(self):
+                return []
+
+        with self.assertRaises(LookupError):
+            query_task_summary(EmptyClient(), "missing-task")
+
     def test_package_fields_add_readable_output_summary(self):
         from feishu_connector import _merge_package_fields
 
@@ -2865,6 +2978,73 @@ class TestFeishuClosedLoop(unittest.TestCase):
             response = conn.getresponse()
             self.assertEqual(response.status, 202)
             self.assertEqual(json.loads(response.read())["status"], "queued")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_feishu_automation_query_route_is_read_only_and_token_protected(self):
+        import json
+        from http.client import HTTPConnection
+        from threading import Thread
+        from feishu_automation import AutomationService, create_server
+
+        calls = []
+        service = AutomationService(
+            runner=lambda record_id: calls.append(("generate", record_id)),
+            query_runner=lambda task_id: {
+                "ok": True, "task_id": task_id, "task_status": "待审核",
+                "candidate_count": 3, "recommended_route": "scene_fit",
+                "candidates": [],
+            },
+        )
+        server = create_server("127.0.0.1", 0, service=service, expected_token="secret")
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            body = json.dumps({"task_id": "A-QUERY-HTTP"})
+            conn.request("POST", "/query", body=body, headers={"Content-Type": "application/json"})
+            self.assertEqual(conn.getresponse().status, 401)
+
+            conn.request("POST", "/query", body=json.dumps({}), headers={
+                "Content-Type": "application/json", "X-LocalPipe-Token": "secret",
+            })
+            response = conn.getresponse()
+            self.assertEqual(response.status, 400)
+            self.assertEqual(json.loads(response.read())["error"], "missing task_id")
+
+            conn.request("POST", "/query", body=body, headers={
+                "Content-Type": "application/json", "X-LocalPipe-Token": "secret",
+            })
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.read())
+            self.assertEqual(payload["recommended_route"], "scene_fit")
+            self.assertEqual(calls, [])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_feishu_automation_query_route_maps_lookup_error_to_404(self):
+        import json
+        from http.client import HTTPConnection
+        from threading import Thread
+        from feishu_automation import AutomationService, create_server
+
+        service = AutomationService(
+            query_runner=lambda task_id: (_ for _ in ()).throw(LookupError("task not found")),
+        )
+        server = create_server("127.0.0.1", 0, service=service, expected_token="secret")
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            conn.request("POST", "/query", body=json.dumps({"task_id": "missing"}), headers={
+                "Content-Type": "application/json", "X-LocalPipe-Token": "secret",
+            })
+            response = conn.getresponse()
+            self.assertEqual(response.status, 404)
+            self.assertEqual(json.loads(response.read())["error"], "task not found")
         finally:
             server.shutdown()
             server.server_close()

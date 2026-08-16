@@ -668,6 +668,197 @@ def _json_value(value: Any, default: Any) -> Any:
         return default
 
 
+def _query_number(value: Any, default: Any = None) -> Any:
+    """Parse a numeric Bitable cell without turning blanks into zero."""
+    if value in (None, ""):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return int(number) if number.is_integer() else number
+
+
+def _query_bool(value: Any, default: Optional[bool] = None) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"true", "1", "yes", "y", "是", "合格", "通过"}:
+        return True
+    if text in {"false", "0", "no", "n", "否", "不合格", "未通过"}:
+        return False
+    return default
+
+
+def _query_candidate_from_record(record: Dict[str, Any], index: int = 1) -> Dict[str, Any]:
+    """Normalize a candidate-table row or output JSON candidate for Aily."""
+    fidelity = _json_value(_field(record, "保真检查", None), None)
+    if not isinstance(fidelity, dict):
+        fidelity = _json_value(_field(record, "fidelity", {}), {})
+    taboo = _json_value(_field(record, "taboo", None), None)
+    if not isinstance(taboo, dict):
+        risk = str(_field(record, "禁忌风险", "") or "unknown").strip().lower()
+        reasons = _field(record, "风险说明", "")
+        taboo = {"risk_level": risk}
+        if reasons:
+            taboo["reasons"] = [str(reasons)]
+    profile_trace = _json_value(_field(record, "画像追溯", None), None)
+    if not isinstance(profile_trace, dict):
+        profile_trace = _json_value(_field(record, "profile_trace", {}), {})
+    raw_hard_gates = _field(record, "硬门禁原因", None)
+    if raw_hard_gates in (None, ""):
+        raw_hard_gates = _field(record, "hard_gate_reasons", None)
+    if raw_hard_gates in (None, ""):
+        hard_gates: List[str] = []
+    elif isinstance(raw_hard_gates, list):
+        hard_gates = [str(item).strip() for item in raw_hard_gates if str(item).strip()]
+    else:
+        hard_gates = [item.strip() for item in str(raw_hard_gates).replace("；", ";").split(";") if item.strip()]
+    brief = _json_value(
+        _field(record, "KreadoAI Brief", None) or _field(record, "kreado_brief", None),
+        None,
+    )
+    if not isinstance(brief, dict):
+        brief = {
+            "prompt": str(_field(record, "KreadoAI Prompt", "") or ""),
+            "json": _json_value(_field(record, "KreadoAI JSON", {}), {}),
+        }
+    route = str(_field(record, "候选路线", "") or _field(record, "variant_id", "") or f"variant_{index}").strip()
+    label = str(_field(record, "路线说明", "") or _field(record, "variant_label", "") or route).strip()
+    score = _query_number(_field(record, "推荐分数", _field(record, "score", None)))
+    rank = _query_number(_field(record, "推荐排名", _field(record, "rank", None)))
+    eligible = _query_bool(_field(record, "是否合格", _field(record, "eligible", None)))
+    return {
+        "route": route,
+        "label": label,
+        "copy": str(_field(record, "本地化文案", "") or _field(record, "copy", "") or ""),
+        "copy_zh": str(_field(record, "中文回译", "") or _field(record, "copy_zh", "") or ""),
+        "score": score,
+        "rank": rank,
+        "eligible": eligible,
+        "fidelity": fidelity,
+        "fidelity_summary": str(_field(record, "保真结论", "") or ""),
+        "taboo": taboo,
+        "risk_summary": str(_field(record, "风险说明", "") or ""),
+        "profile_trace": profile_trace,
+        "profile_summary": str(_field(record, "画像依据摘要", "") or ""),
+        "hard_gate_reasons": hard_gates,
+        "status": str(_field(record, "候选状态", "") or _field(record, "final_status", "") or ""),
+        "kreado_prompt": str(brief.get("prompt", "") or "") if isinstance(brief, dict) else "",
+        "kreado_json": brief.get("json", {}) if isinstance(brief, dict) else {},
+    }
+
+
+def _query_task_status(task: Dict[str, Any], output: Dict[str, Any]) -> str:
+    status = str(_field(task, FIELD_STATUS, "") or "").strip()
+    if status:
+        return status
+    return str(_field(output, "系统状态", "") or "").strip()
+
+
+def query_task_summary(client: FeishuBitableClient, task_id: str) -> Dict[str, Any]:
+    """Return a read-only, Chinese business summary for one LocalPipe task.
+
+    This is intentionally a projection of existing Feishu rows. It never calls
+    ``localize`` and never writes to Bitable, so it is safe to expose as an Aily
+    query tool.
+    """
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise ValueError("missing task_id")
+    tasks = list(client.list_tasks())
+    task = next((row for row in tasks if _output_task_id(row) == task_id), None)
+    outputs = list(client.list_outputs())
+    output = next((row for row in outputs if _output_task_id(row) == task_id), None)
+    if task is None and output is None:
+        raise LookupError(f"task not found: {task_id}")
+
+    output_fields = output.get("fields", output) if isinstance(output, dict) else {}
+    output_record_id = str(output.get("record_id", "")).strip() if isinstance(output, dict) else ""
+    candidates: List[Dict[str, Any]] = []
+    candidate_table = str(getattr(client, "candidate_table", "") or "").strip()
+    if candidate_table and hasattr(client, "list_records"):
+        candidate_rows = client.list_records(candidate_table, getattr(client, "candidate_app_token", None))
+        matching_rows = [
+            row for row in candidate_rows
+            if (output_record_id and str(_field(row, "产出ID", "")).strip() == output_record_id)
+            or str(_field(row, "任务ID", "")).strip() == task_id
+        ]
+        candidates = [_query_candidate_from_record(row, i) for i, row in enumerate(matching_rows, 1)]
+    if not candidates and output is not None:
+        raw_candidates = _json_value(_field(output, "候选变体", []), [])
+        if isinstance(raw_candidates, list):
+            candidates = [_query_candidate_from_record(row, i) for i, row in enumerate(raw_candidates[:3], 1) if isinstance(row, dict)]
+        for index, candidate in enumerate(candidates, 1):
+            if candidate["kreado_prompt"] or candidate["kreado_json"]:
+                continue
+            brief = _json_value(_field(output, f"KreadoAI Brief {index}", {}), {})
+            if isinstance(brief, dict):
+                candidate["kreado_prompt"] = str(brief.get("prompt", "") or "")
+                candidate["kreado_json"] = brief.get("json", {})
+    candidates.sort(key=lambda item: (item["rank"] is None, item["rank"] or 0))
+
+    recommended_route = str(
+        _field(output, "系统推荐变体", "") if output is not None else ""
+    ).strip()
+    if not recommended_route:
+        recommended = next((item for item in candidates if item.get("eligible") is True), None)
+        recommended_route = str(recommended.get("route", "") if recommended else "")
+    recommended = next((item for item in candidates if item.get("route") == recommended_route), None)
+    recommendation_score = _query_number(_field(output, "推荐分数", None) if output is not None else None)
+    recommendation_rank = _query_number(_field(output, "推荐排名", None) if output is not None else None)
+    if recommended:
+        recommendation_score = recommendation_score if recommendation_score is not None else recommended.get("score")
+        recommendation_rank = recommendation_rank if recommendation_rank is not None else recommended.get("rank")
+
+    review = None
+    review_table = str(getattr(client, "review_table", "") or "").strip()
+    if review_table and hasattr(client, "list_records"):
+        reviews = client.list_records(review_table, getattr(client, "review_app_token", None))
+        review = next((row for row in reviews if output_record_id and str(_field(row, "产出ID", "")).strip() == output_record_id), None)
+        if review is None:
+            review = next((row for row in reviews if str(_field(row, "任务ID", "")).strip() == task_id), None)
+
+    task_status = _query_task_status(task or {}, output or {})
+    current_stage = str(_field(task or {}, "当前阶段", "") or "").strip()
+    if not current_stage:
+        current_stage = {"待审核": "待人工审核", "needs_review": "待人工审核", "pass": "待人工审核", "待生成": "等待生成"}.get(
+            task_status, task_status or "状态待确认"
+        )
+    uncertainty = _json_value(_field(output or {}, "不确定性", {}), {})
+    if not isinstance(uncertainty, dict):
+        uncertainty = {"level": str(uncertainty)} if uncertainty else {}
+    review_policy = str(_field(output or {}, "审核策略", "") or "").strip()
+    risk_level = str((recommended or {}).get("taboo", {}).get("risk_level", "") or "").strip().lower()
+    if not risk_level:
+        risk_level = str(_field(output or {}, "风险等级", "") or "unknown").strip().lower()
+    summary = str(_field(output or {}, "三候选业务摘要", "") or "").strip()
+    next_action = str(_field(output or {}, "下一步操作", "") or "").strip()
+    review_status = str(_field(review or {}, "审核状态", "") or "").strip()
+    review_url = str(_field(review or {}, "飞书任务链接", "") or "").strip()
+    candidate_count = _query_number(_field(output or {}, "候选变体数", None), len(candidates)) or len(candidates)
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "task_status": task_status,
+        "current_stage": current_stage,
+        "market": str(_field(output or task or {}, "目标市场", "") or "").strip(),
+        "candidate_count": int(candidate_count),
+        "recommended_route": recommended_route,
+        "recommendation_score": recommendation_score,
+        "recommendation_rank": recommendation_rank,
+        "recommendation_reason": str(_field(output or {}, "推荐理由", "") or "").strip(),
+        "review_policy": review_policy,
+        "uncertainty": uncertainty,
+        "risk_level": risk_level,
+        "review_status": review_status or ("待审核" if task_status in {"待审核", "needs_review"} else ""),
+        "review_task_url": review_url,
+        "summary": summary,
+        "next_action": next_action,
+        "candidates": candidates[:3],
+    }
+
+
 def _risk_label(level: Any) -> str:
     return {
         "low": "低风险",

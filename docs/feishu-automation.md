@@ -1,10 +1,11 @@
 # 飞书自动化 → LocalPipe
 
-这份配置把飞书升级为 LocalPipe 全流程指挥台。HTTP 桥接支持三类指令：
+这份配置把飞书升级为 LocalPipe 全流程指挥台。HTTP 桥接支持三类异步写入指令和一类只读查询：
 
 - `generate`：任务状态变为 `待生成` 后执行 LocalPipe，回写三候选、推荐、质检和 Brief；
 - `complete_review`：审核状态变为 `已完成` 后关闭任务，并按“是否进画像校准”创建待确认修订候选；
 - `sync_metrics`：由飞书定时自动化或按钮刷新比赛指标表。
+- `POST /query`：供 Aily 按任务 ID 查询已有状态、三候选、系统推荐和审核信息；不触发生成、不写入多维表格。
 
 旧请求不传 `action` 时仍默认执行 `generate`，保持兼容。
 
@@ -22,6 +23,7 @@ python feishu_automation.py --host 0.0.0.0 --port 8080
 - `GET /health`：健康检查。
 - `POST /trigger`：接收飞书自动化请求。
 - `POST /webhook`：`/trigger` 的兼容别名。
+- `POST /query`：带相同 token 鉴权的只读任务查询，请求体示例为 `{"task_id":"AILY-FR-001"}`。
 
 ## 飞书自动化配置
 

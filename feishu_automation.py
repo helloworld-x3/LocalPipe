@@ -24,7 +24,14 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Mapping, Optional
 
-from feishu_connector import FeishuBitableClient, complete_review, run_live, sync_metrics_snapshot
+from feishu_connector import (
+    FeishuBitableClient,
+    _make_client,
+    complete_review,
+    query_task_summary,
+    run_live,
+    sync_metrics_snapshot,
+)
 
 
 def extract_record_id(payload: Any) -> str:
@@ -41,6 +48,21 @@ def extract_record_id(payload: Any) -> str:
         record_id = extract_record_id(nested)
         if record_id:
             return record_id
+    return ""
+
+
+def extract_task_id(payload: Any) -> str:
+    """Extract a business task ID from common Aily/Feishu payload shapes."""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("task_id", "taskId", "任务ID"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for container_key in ("data", "event", "body", "payload", "arguments", "params"):
+        task_id = extract_task_id(payload.get(container_key))
+        if task_id:
+            return task_id
     return ""
 
 
@@ -168,12 +190,14 @@ class AutomationService:
         runner: Optional[Callable[[str], Any]] = None,
         review_runner: Optional[Callable[[str], Any]] = None,
         metrics_runner: Optional[Callable[[], Any]] = None,
+        query_runner: Optional[Callable[[str], Dict[str, Any]]] = None,
         event_logger: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ):
         uses_live_runner = runner is None
         self.runner = runner or (lambda record_id: run_live(task_record_id=record_id))
         self.review_runner = review_runner or complete_review
         self.metrics_runner = metrics_runner or sync_metrics_snapshot
+        self.query_runner = query_runner or (lambda task_id: query_task_summary(_make_client(), task_id))
         self.event_logger = event_logger or (build_live_event_logger() if uses_live_runner else (lambda event: None))
         self._active = set()
         self._completed: Dict[str, float] = {}
@@ -189,6 +213,10 @@ class AutomationService:
 
     def submit(self, record_id: str) -> Dict[str, Any]:
         return self.submit_action("generate", record_id)
+
+    def query(self, task_id: str) -> Dict[str, Any]:
+        """Synchronously read an existing result without entering the write queue."""
+        return self.query_runner(str(task_id or "").strip())
 
     def submit_action(self, action: str, record_id: str = "") -> Dict[str, Any]:
         action = str(action or "generate").strip()
@@ -291,7 +319,8 @@ class FeishuAutomationHandler(BaseHTTPRequestHandler):
         self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path.rstrip("/") not in ("", "/trigger", "/webhook"):
+        path = self.path.rstrip("/")
+        if path not in ("", "/trigger", "/webhook", "/query"):
             self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
             return
         try:
@@ -323,6 +352,22 @@ class FeishuAutomationHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "invalid token"})
             return
 
+        if path == "/query":
+            task_id = extract_task_id(payload)
+            if not task_id:
+                self._write_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing task_id"})
+                return
+            try:
+                response = self.service.query(task_id)
+            except LookupError:
+                self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "task not found"})
+                return
+            except Exception:
+                self._write_json(HTTPStatus.BAD_GATEWAY, {"ok": False, "error": "query failed"})
+                return
+            self._write_json(HTTPStatus.OK, response)
+            return
+
         record_id = extract_record_id(payload)
         response = self.service.submit_action(extract_action(payload), record_id)
         self._write_json(HTTPStatus.ACCEPTED if response.get("accepted") else HTTPStatus.BAD_REQUEST, response)
@@ -350,7 +395,7 @@ def main() -> int:
     args = parser.parse_args()
     server = create_server(args.host, args.port)
     print(f"LocalPipe 飞书自动化桥接已启动: http://{args.host}:{args.port}/trigger")
-    print("健康检查: /health；生产环境请通过 HTTPS 反向代理暴露，并配置 FEISHU_AUTOMATION_TOKEN")
+    print("只读查询: /query；健康检查: /health；生产环境请通过 HTTPS 反向代理暴露，并配置 FEISHU_AUTOMATION_TOKEN")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
