@@ -2982,6 +2982,84 @@ class TestFeishuClosedLoop(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_feishu_automation_accepts_feishu_unquoted_record_id_template(self):
+        import json
+        from http.client import HTTPConnection
+        from threading import Thread
+        from feishu_automation import AutomationService, create_server
+
+        started = []
+        service = AutomationService(runner=lambda record_id: started.append(record_id))
+        server = create_server("127.0.0.1", 0, service=service, expected_token="secret")
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            body = '{"action":"generate","record_id":recvssMIWQQUsV}'
+            conn.request("POST", "/trigger", body=body, headers={
+                "Content-Type": "application/json", "X-LocalPipe-Token": "secret",
+            })
+            response = conn.getresponse()
+            self.assertEqual(response.status, 202)
+            self.assertEqual(json.loads(response.read())["record_id"], "recvssMIWQQUsV")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_feishu_connector_normalizes_business_market_labels(self):
+        from feishu_connector import normalize_task_market
+
+        self.assertEqual(normalize_task_market("法国"), "fr")
+        self.assertEqual(normalize_task_market("France"), "fr")
+        self.assertEqual(normalize_task_market("kr"), "kr")
+
+    def test_failed_feishu_output_is_regenerated_and_overwritten(self):
+        from unittest.mock import patch
+        from feishu_connector import _process_one_task
+
+        class FakeClient:
+            output_table = "outputs"
+            output_app_token = "app"
+            review_table = ""
+            candidate_table = ""
+
+            def __init__(self):
+                self.updated_records = []
+
+            def update_task(self, record_id, fields):
+                pass
+
+            def update_record(self, table_id, record_id, fields, app_token=None):
+                self.updated_records.append((table_id, record_id, fields, app_token))
+
+            def create_output(self, fields):
+                raise AssertionError("failed output should be overwritten, not duplicated")
+
+        class FakeStore:
+            def load(self, task):
+                return {"result": {"final_status": "error"}, "output_written": True}
+
+            def save_generated(self, task, result, fields, run_snapshot=None):
+                return {"result": result, "fields": fields, "run_snapshot": run_snapshot or {}}
+
+            def mark_output_written(self, task, output_record_id):
+                pass
+
+        client = FakeClient()
+        task = {"record_id": "task-rec", "fields": {
+            "任务ID": "T-RETRY", "中文原文": "轻盈针织开衫", "目标市场": "法国", "状态": "待生成",
+        }}
+        existing = {"record_id": "out-error", "fields": {"任务ID": "T-RETRY", "系统状态": "error"}}
+        result = {"final_status": "pass"}
+        with patch("feishu_connector.localize", return_value=result), \
+             patch("feishu_connector.build_output", return_value={"任务ID": "T-RETRY", "系统状态": "pass"}), \
+             patch("feishu_connector.ensure_review_record", return_value=""), \
+             patch("feishu_connector.ensure_candidate_records", return_value=[]):
+            _process_one_task(client, FakeStore(), task, existing)
+
+        self.assertEqual(client.updated_records[0][1], "out-error")
+        self.assertEqual(client.updated_records[0][2]["系统状态"], "pass")
+
     def test_feishu_automation_query_route_is_read_only_and_token_protected(self):
         import json
         from http.client import HTTPConnection

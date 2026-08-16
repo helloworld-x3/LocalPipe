@@ -51,6 +51,19 @@ FIELD_MARKET = os.environ.get("FEISHU_FIELD_MARKET", "目标市场")
 FIELD_STATUS = os.environ.get("FEISHU_FIELD_STATUS", "状态")
 FIELD_TASK_ID = os.environ.get("FEISHU_FIELD_TASK_ID", "任务ID")
 
+_MARKET_CODE_ALIASES = {
+    "法国": "fr", "法國": "fr", "france": "fr", "french": "fr", "法语": "fr", "法語": "fr",
+    "韩国": "kr", "韓國": "kr", "south korea": "kr", "korea": "kr", "韩语": "kr", "韓語": "kr",
+    "日本": "jp", "japan": "jp", "日语": "jp", "日語": "jp",
+    "美国": "us", "美國": "us", "united states": "us", "usa": "us", "英语": "us", "英語": "us",
+}
+
+
+def normalize_task_market(value: Any) -> str:
+    """Accept business-facing country labels while keeping pipeline codes strict."""
+    text = str(value or "").strip()
+    return _MARKET_CODE_ALIASES.get(text.lower(), text.lower())
+
 def _request(method: str, url: str, token: Optional[str] = None, body: Any = None) -> Dict[str, Any]:
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json; charset=utf-8"}
@@ -306,7 +319,7 @@ def build_output(task: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]
     return fields
 
 def build_market_insight(task: Dict[str, Any]) -> Dict[str, Any]:
-    market = str(_field(task, FIELD_MARKET, "")).strip().lower()
+    market = normalize_task_market(_field(task, FIELD_MARKET, ""))
     platform = str(_field(task, "平台", "未指定")).strip() or "未指定"
     audience = str(_field(task, "目标人群", "未指定")).strip() or "未指定"
     category = str(_field(task, "产品品类", "通用品类")).strip() or "通用品类"
@@ -351,6 +364,13 @@ def build_market_insight(task: Dict[str, Any]) -> Dict[str, Any]:
 def _build_strategy_package(task: Dict[str, Any], result: Dict[str, Any], route: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build one auditable strategy/Brief for a pipeline result or route candidate."""
     insight = build_market_insight(task)
+    normalized_task = dict(task)
+    normalized_fields = dict(task.get("fields", task))
+    normalized_fields[FIELD_MARKET] = normalize_task_market(_field(task, FIELD_MARKET, ""))
+    if isinstance(task.get("fields"), dict):
+        normalized_task["fields"] = normalized_fields
+    else:
+        normalized_task = normalized_fields
     elements = result.get("elements") or {}
     route = route or {"route_id": "default", "objective": "证据驱动创译"}
     routed_result = dict(result)
@@ -364,7 +384,7 @@ def _build_strategy_package(task: Dict[str, Any], result: Dict[str, Any], route:
     creative_route = route.get("creative_route") or route
     placeholder_copy = "候选未生成文案（仅供审核，禁止投放）"
     strategy = build_strategy({
-        "market": _field(task, FIELD_MARKET),
+        "market": normalize_task_market(_field(task, FIELD_MARKET)),
         "platform": _field(task, "平台", "Meta") or "Meta",
         "category": _field(task, "产品品类", ""),
         "audience": _field(task, "目标人群", elements.get("target_audience", "")) or "目标消费者",
@@ -409,7 +429,7 @@ def _build_strategy_package(task: Dict[str, Any], result: Dict[str, Any], route:
     delivery_result["copy"] = delivery_result.get("copy", "") or placeholder_copy
     delivery = build_transcreation_delivery(delivery_result, creative_route, kreado, language_assets)
     run_snapshot = build_run_snapshot(
-        task,
+        normalized_task,
         routed_result,
         quality_decision=quality_report["release_decision"],
         strategy=strategy,
@@ -1385,7 +1405,13 @@ def _process_one_task(
     existing: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
     checkpoint = checkpoint_store.load(task)
-    if existing:
+    checkpoint_result = (checkpoint or {}).get("result") or {}
+    checkpoint_failed = str(checkpoint_result.get("final_status", "")).strip().lower() == "error"
+    existing_status = str(_field(existing or {}, "系统状态", "")).strip().lower()
+    existing_failed = bool(existing) and existing_status == "error"
+    if checkpoint_failed:
+        checkpoint = None
+    if existing and not existing_failed:
         review_record_id = ensure_review_record(
             client,
             str(existing.get("record_id", "")),
@@ -1426,7 +1452,7 @@ def _process_one_task(
         generation_started = time.monotonic()
         result = localize(
             str(_field(task, FIELD_SOURCE)).strip(),
-            str(_field(task, FIELD_MARKET)).strip(),
+            normalize_task_market(_field(task, FIELD_MARKET)),
             brand=_task_brand(task),
             verbose=False,
         )
@@ -1443,7 +1469,11 @@ def _process_one_task(
         fields["AI总耗时秒"] = run_snapshot["ai_total_seconds"]
         checkpoint = checkpoint_store.save_generated(task, result, fields, run_snapshot=run_snapshot)
 
-    output_record_id = client.create_output(fields)
+    if existing_failed:
+        output_record_id = str(existing.get("record_id", ""))
+        client.update_record(client.output_table, output_record_id, fields, client.output_app_token)
+    else:
+        output_record_id = client.create_output(fields)
     checkpoint_store.mark_output_written(task, output_record_id)
     review_record_id = ensure_review_record(
         client, output_record_id, _review_source_fields(fields, run_snapshot), task_context=task

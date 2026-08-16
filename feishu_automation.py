@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import json
+import re
 import os
 import threading
 import time
@@ -105,6 +106,30 @@ def provided_token(headers: Mapping[str, str], payload: Any = None) -> str:
 
 
 MAX_BODY_BYTES = 64 * 1024
+
+
+def parse_automation_payload(raw_body: bytes) -> Dict[str, Any]:
+    """Parse a normal JSON payload or Feishu's unquoted record-ID template.
+
+    Bitable automation sometimes renders a dynamic ``record_id`` value as a
+    raw token inside the JSON editor.  Accept only that narrow, generated
+    shape; all other malformed request bodies remain rejected.
+    """
+    text = raw_body.decode("utf-8")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.fullmatch(
+            r'\s*\{\s*"action"\s*:\s*"generate"\s*,\s*'
+            r'"record_id"\s*:\s*"?(rec[A-Za-z0-9_-]{4,})"?\s*\}\s*',
+            text,
+        )
+        if not match:
+            raise
+        payload = {"action": "generate", "record_id": match.group(1)}
+    if not isinstance(payload, dict):
+        raise json.JSONDecodeError("payload must be an object", text, 0)
+    return payload
 COMPLETED_TTL = 24 * 3600
 MAX_CONCURRENT_TASKS = 2
 DEFAULT_EVENT_LEDGER = Path(__file__).resolve().parent / ".cache" / "feishu_automation_events.jsonl"
@@ -332,7 +357,7 @@ class FeishuAutomationHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False, "error": "payload too large"})
             return
         try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = parse_automation_payload(self.rfile.read(length))
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._write_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid JSON"})
             return
