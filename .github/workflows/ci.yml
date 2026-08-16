@@ -28,7 +28,10 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       - name: Compile Python modules
-        run: python -m py_compile model.py pipeline.py baseline.py batch.py stats.py test_pipeline.py
+        run: >-
+          python -m py_compile pipeline.py candidate_selection.py feishu_connector.py
+          feishu_automation.py strategy.py kreado_adapter.py feishu_setup_tables.py
+          feishu_metrics.py batch.py model.py baseline.py stats.py test_pipeline.py
 
       - name: Run offline behavior tests
         run: python -m unittest discover -v

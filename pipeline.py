@@ -132,14 +132,20 @@ def _load_hashes():
     return {}
 
 
+def _profile_digest(path):
+    """Hash profile text with normalized newlines so Git checkout mode is irrelevant."""
+    with open(path, "rb") as f:
+        content = f.read().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(content).hexdigest()
+
+
 def verify_profile_integrity(path, market_code):
     """SHA256 版本完整性校验——检测画像文件意外修改"""
     hashes = _load_hashes()
     if market_code not in hashes:
         return  # 无基线哈希，跳过（首次使用需先 gen_profile_hashes）
 
-    with open(path, "rb") as f:
-        actual = hashlib.sha256(f.read()).hexdigest()
+    actual = _profile_digest(path)
 
     expected = hashes[market_code]
     if actual != expected:
@@ -156,10 +162,10 @@ def gen_profile_hashes():
     hashes = {}
     for fn in sorted(os.listdir(profile_dir)):
         if fn.endswith(".json") and not fn.startswith("."):
-            with open(os.path.join(profile_dir, fn), "rb") as f:
-                h = hashlib.sha256(f.read()).hexdigest()
+            profile_path = os.path.join(profile_dir, fn)
+            h = _profile_digest(profile_path)
             # 从文件内容提取 market_code
-            with open(os.path.join(profile_dir, fn), encoding="utf-8") as f:
+            with open(profile_path, encoding="utf-8") as f:
                 code = json.load(f).get("market_code", fn.replace(".json", ""))
             hashes[code] = h
             print(f"  {code}: {h[:16]}...")

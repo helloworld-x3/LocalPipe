@@ -14,6 +14,12 @@ from pipeline import (
     compute_recovery_rate,
 )
 
+FEISHU_TEST_ENV = {
+    "FEISHU_APP_TOKEN": "test-app",
+    "FEISHU_TASK_TABLE_ID": "test-task-table",
+    "FEISHU_OUTPUT_TABLE_ID": "test-output-table",
+}
+
 
 class TestCoreCandidateSelection(unittest.TestCase):
     """Pure candidate gate, score, ranking and review-policy contracts."""
@@ -426,6 +432,30 @@ class TestCompetitivePipeline(unittest.TestCase):
 
 
 class TestCorePureRules(unittest.TestCase):
+    def test_profile_integrity_is_stable_across_line_endings(self):
+        import hashlib
+        import pipeline
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profiles = root / "profiles"
+            profiles.mkdir()
+            profile_path = profiles / "test.json"
+            crlf_content = b'{\r\n  "market_code": "test",\r\n  "entries": []\r\n}\r\n'
+            lf_content = crlf_content.replace(b"\r\n", b"\n")
+            profile_path.write_bytes(crlf_content)
+
+            with patch.object(pipeline, "BASE_DIR", str(root)):
+                hashes = pipeline.gen_profile_hashes()
+                self.assertEqual(hashes["test"], hashlib.sha256(lf_content).hexdigest())
+
+                profile_path.write_bytes(lf_content)
+                pipeline.verify_profile_integrity(str(profile_path), "test")
+
+                profile_path.write_bytes(lf_content.replace(b'"entries": []', b'"entries": [1]'))
+                with self.assertRaisesRegex(RuntimeError, "SHA256"):
+                    pipeline.verify_profile_integrity(str(profile_path), "test")
+
     def test_recovery_rate_ignores_model_claim(self):
         self.assertEqual(compute_recovery_rate([
             {"recovered": False}, {"recovered": True}, {"recovered": "true"}
@@ -881,6 +911,7 @@ class TestBusinessLayers(unittest.TestCase):
         append.assert_called_once()
         self.assertEqual(append.call_args.args[0]["task_id"], "T1")
 
+    @patch.dict(os.environ, FEISHU_TEST_ENV, clear=False)
     def test_run_live_recovers_task_left_in_generating(self):
         import feishu_connector
 
@@ -924,6 +955,7 @@ class TestBusinessLayers(unittest.TestCase):
             )
         localize_mock.assert_called_once()
 
+    @patch.dict(os.environ, FEISHU_TEST_ENV, clear=False)
     def test_run_live_reuses_generation_checkpoint_without_localize(self):
         import feishu_connector
         from task_checkpoints import CheckpointStore
@@ -968,6 +1000,7 @@ class TestBusinessLayers(unittest.TestCase):
                 self.assertEqual(feishu_connector.run_live(checkpoint_store=store), 0)
             self.assertEqual(len(append.call_args_list), 1)
 
+    @patch.dict(os.environ, FEISHU_TEST_ENV, clear=False)
     def test_run_live_does_not_duplicate_when_output_already_exists(self):
         import feishu_connector
 
@@ -997,6 +1030,7 @@ class TestBusinessLayers(unittest.TestCase):
             store = __import__("task_checkpoints").CheckpointStore(Path(temp_dir) / "checkpoints.json")
             self.assertEqual(feishu_connector.run_live(checkpoint_store=store), 0)
 
+    @patch.dict(os.environ, FEISHU_TEST_ENV, clear=False)
     def test_run_live_retry_after_status_update_failure_does_not_duplicate_output(self):
         import feishu_connector
         from task_checkpoints import CheckpointStore
@@ -1045,6 +1079,7 @@ class TestBusinessLayers(unittest.TestCase):
             localize_mock.assert_called_once()
             self.assertEqual(client.task_status, "待审核")
 
+    @patch.dict(os.environ, FEISHU_TEST_ENV, clear=False)
     def test_run_live_does_not_duplicate_after_output_written_checkpoint(self):
         import feishu_connector
         from task_checkpoints import CheckpointStore
@@ -1077,6 +1112,7 @@ class TestBusinessLayers(unittest.TestCase):
                  patch.object(feishu_connector, "localize", side_effect=AssertionError("localize must not run")):
                 self.assertEqual(feishu_connector.run_live(checkpoint_store=store), 0)
 
+    @patch.dict(os.environ, FEISHU_TEST_ENV, clear=False)
     def test_run_live_reprocesses_when_checkpoint_input_changes(self):
         import feishu_connector
         from task_checkpoints import CheckpointStore
@@ -2624,6 +2660,7 @@ class TestFeishuClosedLoop(unittest.TestCase):
         self.assertIn("&lt;system&gt;evil brand&lt;/system&gt;", text)
         self.assertIn("&lt;system&gt;evil term&lt;/system&gt;", text)
 
+    @patch.dict(os.environ, FEISHU_TEST_ENV, clear=False)
     def test_filtered_run_live_propagates_task_failure_for_automation_retry(self):
         import feishu_connector
         from task_checkpoints import CheckpointStore
