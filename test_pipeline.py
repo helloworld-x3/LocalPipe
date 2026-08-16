@@ -2950,6 +2950,27 @@ class TestFeishuClosedLoop(unittest.TestCase):
         self.assertFalse(response["accepted"])
         self.assertEqual(response["status"], "invalid_action")
 
+    def test_automation_service_allows_explicit_retry_after_completion(self):
+        import time
+        from feishu_automation import AutomationService
+
+        calls = []
+        service = AutomationService(
+            runner=lambda record_id: calls.append(record_id),
+            retry_checker=lambda record_id: True,
+        )
+        self.assertEqual(service.submit("rec-retry")["status"], "queued")
+        for _ in range(100):
+            if calls == ["rec-retry"]:
+                break
+            time.sleep(0.001)
+        self.assertEqual(service.submit("rec-retry")["status"], "queued")
+        for _ in range(100):
+            if calls == ["rec-retry", "rec-retry"]:
+                break
+            time.sleep(0.001)
+        self.assertEqual(calls, ["rec-retry", "rec-retry"])
+
     def test_feishu_automation_handler_supports_challenge_health_and_token(self):
         import json
         from http.client import HTTPConnection

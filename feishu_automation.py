@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from feishu_connector import (
+    FIELD_STATUS,
     FeishuBitableClient,
     _make_client,
     complete_review,
@@ -33,6 +34,22 @@ from feishu_connector import (
     run_live,
     sync_metrics_snapshot,
 )
+
+
+def task_waiting_for_generation(record_id: str) -> bool:
+    """Return whether an existing task was explicitly reset for regeneration."""
+    record_id = str(record_id or "").strip()
+    if not record_id:
+        return False
+    try:
+        task = next(
+            (row for row in _make_client().list_tasks() if str(row.get("record_id", "")).strip() == record_id),
+            None,
+        )
+    except Exception:
+        return False
+    fields = (task or {}).get("fields") or {}
+    return str(fields.get(FIELD_STATUS, "")).strip() == "待生成"
 
 
 def extract_record_id(payload: Any) -> str:
@@ -217,6 +234,7 @@ class AutomationService:
         metrics_runner: Optional[Callable[[], Any]] = None,
         query_runner: Optional[Callable[[str], Dict[str, Any]]] = None,
         event_logger: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        retry_checker: Optional[Callable[[str], bool]] = None,
     ):
         uses_live_runner = runner is None
         self.runner = runner or (lambda record_id: run_live(task_record_id=record_id))
@@ -224,6 +242,7 @@ class AutomationService:
         self.metrics_runner = metrics_runner or sync_metrics_snapshot
         self.query_runner = query_runner or (lambda task_id: query_task_summary(_make_client(), task_id))
         self.event_logger = event_logger or (build_live_event_logger() if uses_live_runner else (lambda event: None))
+        self.retry_checker = retry_checker or (task_waiting_for_generation if uses_live_runner else None)
         self._active = set()
         self._completed: Dict[str, float] = {}
         self._lock = threading.Lock()
@@ -255,6 +274,14 @@ class AutomationService:
             now = time.time()
             for rid in [r for r, ts in self._completed.items() if now - ts > COMPLETED_TTL]:
                 self._completed.pop(rid, None)
+            retry_requested = (
+                action == "generate"
+                and dedupe_key in self._completed
+                and self.retry_checker is not None
+                and self.retry_checker(record_id)
+            )
+            if retry_requested:
+                self._completed.pop(dedupe_key, None)
             if dedupe_key in self._active or dedupe_key in self._completed:
                 self._log_event({"event": "duplicate", "action": action, "record_id": record_id})
                 return {"accepted": True, "status": "duplicate", "action": action, "record_id": record_id}
