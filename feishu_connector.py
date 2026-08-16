@@ -155,8 +155,14 @@ class FeishuBitableClient:
         output_app_token: Optional[str] = None,
         review_table: str = "",
         revision_table: str = "",
+        candidate_table: str = "",
+        event_table: str = "",
+        metrics_table: str = "",
         review_app_token: Optional[str] = None,
         revision_app_token: Optional[str] = None,
+        candidate_app_token: Optional[str] = None,
+        event_app_token: Optional[str] = None,
+        metrics_app_token: Optional[str] = None,
     ):
         self.app_token = app_token
         self.task_table = task_table
@@ -164,8 +170,14 @@ class FeishuBitableClient:
         self.output_app_token = output_app_token or app_token
         self.review_table = review_table
         self.revision_table = revision_table
+        self.candidate_table = candidate_table
+        self.event_table = event_table
+        self.metrics_table = metrics_table
         self.review_app_token = review_app_token or self.output_app_token
         self.revision_app_token = revision_app_token or self.output_app_token
+        self.candidate_app_token = candidate_app_token or self.output_app_token
+        self.event_app_token = event_app_token or self.output_app_token
+        self.metrics_app_token = metrics_app_token or self.output_app_token
         app_id, secret = os.environ.get("FEISHU_APP_ID"), os.environ.get("FEISHU_APP_SECRET")
         if not app_id or not secret:
             raise RuntimeError("缺少 FEISHU_APP_ID / FEISHU_APP_SECRET")
@@ -232,6 +244,33 @@ class FeishuBitableClient:
     def create_output(self, fields: Dict[str, Any]) -> str:
         return self.create_record(self.output_table, fields, self.output_app_token)
 
+    def create_feishu_task(
+        self,
+        summary: str,
+        description: str,
+        assignee_id: str,
+        due_timestamp: Optional[int] = None,
+    ) -> Dict[str, str]:
+        """Create a Feishu Task v2 node assigned to one reviewer."""
+        body: Dict[str, Any] = {
+            "summary": str(summary or "").strip(),
+            "description": str(description or "").strip(),
+            "members": [{"id": assignee_id, "type": "user", "role": "assignee"}],
+        }
+        if due_timestamp:
+            body["due"] = {"timestamp": int(due_timestamp), "is_all_day": False}
+        data = _request(
+            "POST",
+            f"{FEISHU_BASE_URL}/open-apis/task/v2/tasks?user_id_type=open_id",
+            self.tenant_token,
+            body,
+        ).get("data", {})
+        task = data.get("task", {}) if isinstance(data, dict) else {}
+        return {
+            "guid": str(task.get("guid", "")),
+            "url": str(task.get("url", "")),
+        }
+
 
 def build_output(task: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
     fidelity = result.get("fidelity") or {}
@@ -246,7 +285,7 @@ def build_output(task: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]
         "cta": elements.get("cta", ""),
         "adaptation_note": result.get("adaptation_note", ""),
     }
-    return {
+    fields = {
         "任务ID": _field(task, FIELD_TASK_ID),
         "目标市场": _field(task, FIELD_MARKET),
         "本地化文案": result.get("copy", ""),
@@ -261,6 +300,10 @@ def build_output(task: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]
         "错误信息": "; ".join(result.get("errors") or []),
         "生成时间": int(datetime.now(timezone.utc).timestamp() * 1000),
     }
+    primary_field = str(os.environ.get("FEISHU_OUTPUT_PRIMARY_FIELD", "")).strip()
+    if primary_field:
+        fields[primary_field] = f"{_field(task, FIELD_TASK_ID)} | {_field(task, FIELD_MARKET)}"
+    return fields
 
 def build_market_insight(task: Dict[str, Any]) -> Dict[str, Any]:
     market = str(_field(task, FIELD_MARKET, "")).strip().lower()
@@ -485,9 +528,31 @@ def _merge_package_fields(fields: Dict[str, Any], package: Dict[str, Any]) -> No
         "KreadoAI JSON": json.dumps(package["kreado"]["json"], ensure_ascii=False),
     })
     variants = package.get("variants") or []
+    review_variants = []
+    for variant in variants:
+        localpipe_result = variant.get("localpipe_result") or {}
+        review_variants.append({
+            "variant_id": variant.get("variant_id", ""),
+            "variant_label": variant.get("variant_label", ""),
+            "copy": localpipe_result.get("copy", ""),
+            "copy_zh": localpipe_result.get("copy_zh", ""),
+            "adaptation_note": localpipe_result.get("adaptation_note", ""),
+            "creative_route": variant.get("creative_route") or {},
+            "fidelity": variant.get("fidelity") or {},
+            "taboo": variant.get("taboo") or {},
+            "profile_trace": variant.get("profile_trace") or {},
+            "score": variant.get("score"),
+            "rank": variant.get("rank"),
+            "eligible": variant.get("eligible"),
+            "hard_gate_reasons": variant.get("hard_gate_reasons") or [],
+            "final_status": localpipe_result.get("final_status", ""),
+            "errors": localpipe_result.get("errors") or [],
+        })
     fields.update({
         "候选变体数": len(variants),
-        "候选变体": json.dumps(variants, ensure_ascii=False),
+        # 飞书长文本字段只承载人工审核所需的候选摘要。完整 KreadoAI
+        # Brief 已分别写入三个独立字段，避免重复策略/快照导致单元格超限。
+        "候选变体": json.dumps(review_variants, ensure_ascii=False),
         "系统推荐变体": package.get("recommended_variant_id", "default"),
         "推荐分数": str(package.get("recommendation_score", "")),
         "推荐排名": str(package.get("recommendation_rank", "")),
@@ -495,6 +560,30 @@ def _merge_package_fields(fields: Dict[str, Any], package: Dict[str, Any]) -> No
         "审核策略": (package.get("selection_decision") or {}).get("review_policy", ""),
         "不确定性": json.dumps((package.get("selection_decision") or {}).get("uncertainty", {}), ensure_ascii=False),
         "候选选择决策": json.dumps(package.get("selection_decision", {}), ensure_ascii=False),
+    })
+    recommended_id = str(package.get("recommended_variant_id", "")).strip()
+    recommended = next(
+        (item for item in variants if str(item.get("variant_id", "")).strip() == recommended_id),
+        variants[0] if variants else {},
+    )
+    recommended_result = recommended.get("localpipe_result") or {}
+    summary_lines = []
+    for index, variant in enumerate(variants[:3], 1):
+        result = variant.get("localpipe_result") or {}
+        score = variant.get("score")
+        try:
+            score_text = f"{float(score):.4f}"
+        except (TypeError, ValueError):
+            score_text = "暂无"
+        marker = "｜系统推荐" if str(variant.get("variant_id", "")).strip() == recommended_id else ""
+        label = str(variant.get("variant_label") or variant.get("variant_id") or f"候选 {index}").strip()
+        note = str(result.get("adaptation_note", "")).strip()
+        summary_lines.append(f"{index}. {label}｜得分 {score_text}{marker}" + (f"｜{note}" if note else ""))
+    fields.update({
+        "推荐文案": str(recommended_result.get("copy", "")),
+        "推荐中文回译": str(recommended_result.get("copy_zh", "")),
+        "三候选业务摘要": "\n".join(summary_lines),
+        "下一步操作": "请在人工审核表查看三候选，填写采用意见、修改建议和是否进入规则校准。",
     })
     for index in range(3):
         brief = variants[index].get("kreado_brief") if index < len(variants) else {}
@@ -526,7 +615,12 @@ def _output_task_id(record: Dict[str, Any]) -> str:
     return str(_field(record, FIELD_TASK_ID, "") or _field(record, "task_id", "")).strip()
 
 
-def _review_fields(output_record_id: str, output_fields: Dict[str, Any]) -> Dict[str, Any]:
+def _review_fields(
+    output_record_id: str,
+    output_fields: Dict[str, Any],
+    now_ms: Optional[int] = None,
+) -> Dict[str, Any]:
+    review_started_at = int(now_ms if now_ms is not None else time.time() * 1000)
     fields = {
         "产出ID": str(output_record_id or "").strip(),
         "任务ID": str(_field(output_fields, "任务ID", "")).strip(),
@@ -537,9 +631,17 @@ def _review_fields(output_record_id: str, output_fields: Dict[str, Any]) -> Dict
         "推荐理由": str(_field(output_fields, "推荐理由", "")).strip(),
         "审核策略": str(_field(output_fields, "审核策略", "")).strip(),
         "不确定性": str(_field(output_fields, "不确定性", "")).strip(),
+        "审核工作台摘要": (
+            f"系统已生成 {_field(output_fields, '候选变体数', 0) or 0} 个候选；"
+            f"推荐路线：{str(_field(output_fields, '系统推荐变体', '')).strip() or '待确认'}；"
+            f"推荐理由：{str(_field(output_fields, '推荐理由', '')).strip() or '请结合候选详情审核'}"
+        ),
+        "审核填写提示": "请填写采用意见、修改程度、采用候选、修改建议，并确认是否进入规则校准。",
+        "飞书任务状态": "待创建",
         "审核状态": "待审核",
         "归纳状态": "待归纳",
-        "审核时间": int(time.time() * 1000),
+        "审核时间": review_started_at,
+        "审核开始时间": review_started_at,
     }
     ai_total_seconds = _field(output_fields, "AI总耗时秒", "")
     if ai_total_seconds not in (None, ""):
@@ -557,11 +659,212 @@ def _review_source_fields(
     return review_fields
 
 
+def _json_value(value: Any, default: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+
+
+def _risk_label(level: Any) -> str:
+    return {
+        "low": "低风险",
+        "medium": "中风险",
+        "high": "高风险",
+        "unknown": "风险待确认",
+    }.get(str(level or "unknown").strip().lower(), "风险待确认")
+
+
+def _risk_details(taboo: Dict[str, Any]) -> str:
+    reasons = taboo.get("reasons") or []
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    flags = taboo.get("flags") or []
+    details = [str(item).strip() for item in reasons if str(item).strip()]
+    for flag in flags:
+        detail = flag.get("detail", "") if isinstance(flag, dict) else flag
+        if str(detail).strip():
+            details.append(str(detail).strip())
+    return "；".join(dict.fromkeys(details)) or "未发现明确文化或合规风险"
+
+
+def _fidelity_business_fields(fidelity: Dict[str, Any]) -> Dict[str, str]:
+    checks = fidelity.get("checks") or []
+    valid_checks = [item for item in checks if isinstance(item, dict)]
+    passed = sum(item.get("recovered") is True for item in valid_checks)
+    total = len(valid_checks)
+    if total and passed == total:
+        conclusion = f"全部通过（{passed}/{total}）"
+    elif total:
+        conclusion = f"存在缺失（{passed}/{total} 通过）"
+    else:
+        conclusion = "暂无可展示的保真检查"
+    product_checks = [
+        item for item in valid_checks
+        if str(item.get("kind", "")).strip().lower() in {"product_type", "product_category"}
+    ]
+    if not product_checks:
+        product_conclusion = "本轮未单列产品类别检查"
+    else:
+        source = str(product_checks[0].get("source") or product_checks[0].get("element") or "产品类别").strip()
+        product_conclusion = (
+            f"产品类别已保持：{source}"
+            if all(item.get("recovered") is True for item in product_checks)
+            else f"产品类别需复核：{source}"
+        )
+    return {"保真结论": conclusion, "产品类别结论": product_conclusion}
+
+
+def _profile_business_fields(profile_trace: Dict[str, Any], market: str) -> Dict[str, str]:
+    valid_ids = [str(item).strip() for item in (profile_trace.get("valid_ids") or []) if str(item).strip()]
+    taboo_ids = [str(item).strip() for item in (profile_trace.get("taboo_ids") or []) if str(item).strip()]
+    market_label = {"fr": "法国", "kr": "韩国", "jp": "日本", "us": "美国"}.get(
+        str(market or "").strip().lower(), str(market or "目标市场").strip()
+    )
+    if valid_ids:
+        summary = f"引用 {len(valid_ids)} 条{market_label}画像规则"
+        if taboo_ids:
+            summary += f"；其中 {len(taboo_ids)} 条涉及风险判断"
+    else:
+        summary = "未引用可追溯画像规则，请人工复核"
+    return {"画像依据摘要": summary, "证据ID": ", ".join(valid_ids)}
+
+
+def _candidate_business_fields(variant: Dict[str, Any], market: str) -> Dict[str, str]:
+    fidelity = variant.get("fidelity") or {}
+    taboo = variant.get("taboo") or {}
+    profile_trace = variant.get("profile_trace") or {}
+    risk_level = str(taboo.get("risk_level", "unknown")).strip().lower()
+    hard_gates = [str(item).strip() for item in (variant.get("hard_gate_reasons") or []) if str(item).strip()]
+    focus = []
+    if hard_gates:
+        focus.append("先处理硬门禁：" + "；".join(hard_gates))
+    if risk_level not in ("", "low"):
+        focus.append("建议重点核对风险表达")
+    if variant.get("eligible") is False:
+        focus.append("该候选当前不建议直接发布")
+    if not focus:
+        focus.append("重点核对产品事实、法语自然度和品牌语气")
+    return {
+        **_fidelity_business_fields(fidelity),
+        "风险等级中文": _risk_label(risk_level),
+        "风险说明": _risk_details(taboo),
+        **_profile_business_fields(profile_trace, market),
+        "审核重点": "；".join(focus),
+    }
+
+
+def ensure_candidate_records(
+    client: FeishuBitableClient,
+    output_record_id: str,
+    output_fields: Dict[str, Any],
+    existing_candidates: Optional[Iterable[Dict[str, Any]]] = None,
+) -> List[str]:
+    """Create one reviewer-friendly Feishu row per candidate, idempotently."""
+    candidate_table = getattr(client, "candidate_table", "")
+    if not candidate_table:
+        return []
+    candidate_app_token = getattr(client, "candidate_app_token", None)
+    existing = list(existing_candidates) if existing_candidates is not None else client.list_records(
+        candidate_table, candidate_app_token
+    )
+    by_route = {
+        str(_field(row, "候选路线", "")).strip(): str(row.get("record_id", "")).strip()
+        for row in existing
+        if str(_field(row, "产出ID", "")).strip() == str(output_record_id or "").strip()
+    }
+    variants = _json_value(_field(output_fields, "候选变体", ""), [])
+    recommended = str(_field(output_fields, "系统推荐变体", "")).strip()
+    record_ids = []
+    for index, variant in enumerate(variants[:3], 1):
+        if not isinstance(variant, dict):
+            continue
+        route_id = str(variant.get("variant_id", f"variant_{index}")).strip()
+        existing_id = by_route.get(route_id, "")
+        if existing_id:
+            client.update_record(
+                candidate_table,
+                existing_id,
+                _candidate_business_fields(
+                    variant,
+                    str(_field(output_fields, "目标市场", "")).strip(),
+                ),
+                candidate_app_token,
+            )
+            record_ids.append(existing_id)
+            continue
+        brief = _json_value(_field(output_fields, f"KreadoAI Brief {index}", ""), {})
+        fields = {
+            "产出ID": str(output_record_id or "").strip(),
+            "任务ID": str(_field(output_fields, "任务ID", "")).strip(),
+            "目标市场": str(_field(output_fields, "目标市场", "")).strip(),
+            "候选路线": route_id,
+            "路线说明": str(variant.get("variant_label", "")),
+            "本地化文案": str(variant.get("copy", "")),
+            "中文回译": str(variant.get("copy_zh", "")),
+            "适配说明": str(variant.get("adaptation_note", "")),
+            "是否系统推荐": route_id == recommended,
+            "推荐分数": variant.get("score") if variant.get("score") is not None else 0,
+            "推荐排名": variant.get("rank") if variant.get("rank") is not None else index,
+            "是否合格": bool(variant.get("eligible")),
+            "候选状态": str(variant.get("final_status", "")),
+            "保真检查": json.dumps(variant.get("fidelity") or {}, ensure_ascii=False),
+            "禁忌风险": str((variant.get("taboo") or {}).get("risk_level", "unknown")),
+            "画像追溯": json.dumps(variant.get("profile_trace") or {}, ensure_ascii=False),
+            "硬门禁原因": "; ".join(variant.get("hard_gate_reasons") or []),
+            "错误信息": "; ".join(variant.get("errors") or []),
+            "KreadoAI Prompt": str(brief.get("prompt", "")) if isinstance(brief, dict) else "",
+            "KreadoAI JSON": json.dumps(brief.get("json") or {}, ensure_ascii=False) if isinstance(brief, dict) else "{}",
+            "生成时间": _field(output_fields, "生成时间", int(time.time() * 1000)),
+        }
+        fields.update(_candidate_business_fields(
+            variant,
+            str(_field(output_fields, "目标市场", "")).strip(),
+        ))
+        record_id = client.create_record(candidate_table, fields, candidate_app_token)
+        if record_id:
+            client.update_record(candidate_table, record_id, {"候选记录ID": record_id}, candidate_app_token)
+            record_ids.append(record_id)
+    return record_ids
+
+
+def _task_completion_fields(
+    output_record_id: str,
+    output_fields: Dict[str, Any],
+    run_snapshot: Optional[Dict[str, Any]] = None,
+    review_record_id: str = "",
+) -> Dict[str, Any]:
+    output_status = str(_field(output_fields, "系统状态", "error")).strip().lower()
+    score = _field(output_fields, "推荐分数", "")
+    try:
+        numeric_score = float(score) if score not in (None, "") else None
+    except (TypeError, ValueError):
+        numeric_score = None
+    fields = {
+        FIELD_STATUS: "异常" if output_status == "error" else "待审核",
+        "当前阶段": "异常" if output_status == "error" else "待人工审核",
+        "结果记录ID": str(output_record_id or ""),
+        "候选变体数": int(_field(output_fields, "候选变体数", 0) or 0),
+        "系统推荐": str(_field(output_fields, "系统推荐变体", "")),
+        "审核策略": str(_field(output_fields, "审核策略", "")),
+        "风险等级": str(_field(output_fields, "禁忌风险", "")),
+        "审核记录ID": str(review_record_id or ""),
+        "AI总耗时秒": (run_snapshot or {}).get("ai_total_seconds", 0),
+        "异常摘要": str(_field(output_fields, "错误信息", "")),
+    }
+    if numeric_score is not None:
+        fields["推荐分数"] = numeric_score
+    return fields
+
+
 def ensure_review_record(
     client: FeishuBitableClient,
     output_record_id: str,
     output_fields: Dict[str, Any],
     existing_reviews: Optional[Iterable[Dict[str, Any]]] = None,
+    task_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Create one review task per output and return the review record ID."""
     review_table = getattr(client, "review_table", "")
@@ -573,10 +876,25 @@ def ensure_review_record(
     )
     for review in reviews:
         if str(_field(review, "产出ID", "")).strip() == str(output_record_id or "").strip():
-            return str(review.get("record_id", "")).strip()
+            review_id = str(review.get("record_id", "")).strip()
+            if review_id:
+                assignee = _field(task_context or {}, "任务负责人", [])
+                if assignee and not _field(review, "审核负责人", []):
+                    try:
+                        client.update_record(
+                            review_table, review_id, {"审核负责人": assignee}, review_app_token
+                        )
+                    except Exception:
+                        pass
+                ensure_feishu_review_task(client, review_id)
+            return review_id
+    review_fields = _review_fields(output_record_id, output_fields)
+    assignee = _field(task_context or {}, "任务负责人", [])
+    if assignee:
+        review_fields["审核负责人"] = assignee
     new_id = client.create_record(
         review_table,
-        _review_fields(output_record_id, output_fields),
+        review_fields,
         review_app_token,
     )
     if new_id:
@@ -586,7 +904,287 @@ def ensure_review_record(
             {"审核记录ID": new_id},
             review_app_token,
         )
+        ensure_feishu_review_task(client, new_id)
     return new_id
+
+
+def _person_open_id(value: Any) -> str:
+    people = value if isinstance(value, list) else [value]
+    for person in people:
+        if not isinstance(person, dict):
+            continue
+        for key in ("id", "open_id", "openId"):
+            if str(person.get(key, "")).strip():
+                return str(person[key]).strip()
+    return ""
+
+
+def ensure_feishu_review_task(
+    client: FeishuBitableClient,
+    review_record_id: str,
+) -> Dict[str, str]:
+    """Create one real Feishu Task node per review record without blocking generation."""
+    reviews = client.list_records(client.review_table, client.review_app_token)
+    review = next((row for row in reviews if str(row.get("record_id", "")) == str(review_record_id)), None)
+    if not review:
+        return {"task_guid": "", "task_url": "", "status": "未创建：审核记录不存在"}
+    existing_guid = str(_field(review, "飞书任务GUID", "")).strip()
+    existing_url = str(_field(review, "飞书任务链接", "")).strip()
+    existing_status = str(_field(review, "飞书任务状态", "")).strip()
+    if existing_guid:
+        return {"task_guid": existing_guid, "task_url": existing_url, "status": existing_status or "已创建"}
+    assignee_id = _person_open_id(_field(review, "审核负责人", []))
+    if not assignee_id:
+        status = "未创建：缺少审核负责人"
+        client.update_record(
+            client.review_table, str(review_record_id), {"飞书任务状态": status}, client.review_app_token
+        )
+        return {"task_guid": "", "task_url": "", "status": status}
+    task_id = str(_field(review, "任务ID", "")).strip() or str(review_record_id)
+    summary = f"审核 LocalPipe 三候选｜{task_id}"
+    description = str(_field(review, "审核工作台摘要", "")).strip()
+    if not description:
+        description = "请进入 LocalPipe 人工审核表，对三条候选文案完成采用、修改和规则校准判断。"
+    due_value = _field(review, "审核截止时间", "")
+    try:
+        due_timestamp = int(due_value) if due_value not in (None, "") else None
+    except (TypeError, ValueError):
+        due_timestamp = None
+    try:
+        created = client.create_feishu_task(summary, description, assignee_id, due_timestamp)
+        task_guid = str(created.get("guid", "")).strip()
+        task_url = str(created.get("url", "")).strip()
+        if not task_guid:
+            raise RuntimeError("飞书任务接口未返回任务 GUID")
+        status = "已创建"
+        client.update_record(
+            client.review_table,
+            str(review_record_id),
+            {"飞书任务GUID": task_guid, "飞书任务链接": task_url, "飞书任务状态": status},
+            client.review_app_token,
+        )
+        return {"task_guid": task_guid, "task_url": task_url, "status": status}
+    except Exception as exc:
+        message = str(exc)
+        status = "未创建：权限待开通" if "权限" in message or "999916" in message else "未创建：飞书任务接口失败"
+        client.update_record(
+            client.review_table, str(review_record_id), {"飞书任务状态": status}, client.review_app_token
+        )
+        return {"task_guid": "", "task_url": "", "status": status}
+
+
+_ENGINEERING_RULE_KEYWORDS = (
+    "源 brief", "源brief", "新增事实", "未提供", "产品类型", "产品类别", "材质", "成分",
+    "美利奴", "chemise", "cardigan", "gilet", "事实保护", "类别保护",
+)
+_MARKET_RULE_KEYWORDS = (
+    "绝对化", "confort absolu", "巴黎", "法式", "自然度", "地道", "语气", "文化", "合规",
+    "冒犯", "不适", "法国", "法语", "夸张", "风险",
+)
+
+
+def _matching_feedback_clauses(text: str, keywords: Iterable[str]) -> List[str]:
+    clauses = [item.strip() for item in text.replace("\n", "；").split("；") if item.strip()]
+    lowered_keywords = tuple(keyword.lower() for keyword in keywords)
+    return [clause for clause in clauses if any(keyword in clause.lower() for keyword in lowered_keywords)]
+
+
+def build_scoped_revision_candidates(review: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Split one human review into engineering and market-rule candidates deterministically."""
+    review_id = str(_field(review, "审核记录ID", "")).strip() or str(review.get("record_id", "")).strip()
+    market = str(_field(review, "目标市场", "")).strip().lower()
+    raw = str(_field(review, "原始反馈", "")).strip()
+    suggestion = str(_field(review, "修改建议", "")).strip()
+    ai_summary = str(_field(review, "飞书AI审核摘要", "")).strip()
+    combined = "；".join(item for item in (raw, suggestion, ai_summary) if item)
+    if not combined:
+        return []
+    definitions = (
+        ("工程规则", _ENGINEERING_RULE_KEYWORDS, False, "LocalPipe 全市场工程质检"),
+        ("市场画像规则", _MARKET_RULE_KEYWORDS, True, f"{market or '目标市场'}市场文案与风险判断"),
+    )
+    candidates = []
+    for scope, keywords, allow_profile, applies_to in definitions:
+        clauses = _matching_feedback_clauses(combined, keywords)
+        if not clauses:
+            continue
+        content = "；".join(dict.fromkeys(clauses))
+        candidates.append({
+            "目标市场": market,
+            "动作": "新增",
+            "条目类型": "工程事实保护" if scope == "工程规则" else "市场表达与风险",
+            "新条目内容": content,
+            "建议置信度": "中",
+            "来源": "飞书人工审核闭环",
+            "依据理由": raw or suggestion,
+            "引用审核记录": review_id,
+            "规则归属": scope,
+            "适用范围": applies_to,
+            "允许画像回灌": allow_profile,
+            "拆分来源": "人工反馈确定性拆分",
+            "状态": "待确认",
+            "生成时间": int(time.time() * 1000),
+        })
+    if candidates:
+        return candidates
+    return [{
+        "目标市场": market,
+        "动作": "新增",
+        "条目类型": "待人工分类",
+        "新条目内容": combined,
+        "建议置信度": "低",
+        "来源": "飞书人工审核闭环",
+        "依据理由": raw or suggestion,
+        "引用审核记录": review_id,
+        "规则归属": "市场画像规则",
+        "适用范围": f"{market or '目标市场'}待人工确认",
+        "允许画像回灌": False,
+        "拆分来源": "未命中规则，待人工确认",
+        "状态": "待确认",
+        "生成时间": int(time.time() * 1000),
+    }]
+
+
+def complete_review(
+    review_record_id: str,
+    client: Optional[FeishuBitableClient] = None,
+    now_ms: Optional[int] = None,
+) -> Dict[str, str]:
+    """Close one Feishu review and optionally create one profile-calibration candidate."""
+    client = client or _make_client()
+    reviews = client.list_records(client.review_table, client.review_app_token)
+    review = next((row for row in reviews if str(row.get("record_id", "")) == str(review_record_id)), None)
+    if not review:
+        raise RuntimeError(f"未找到审核记录: {review_record_id}")
+    if str(_field(review, "审核状态", "")).strip() != "已完成":
+        raise RuntimeError("审核记录尚未完成")
+    task_id = str(_field(review, "任务ID", "")).strip()
+    task = next((row for row in client.list_tasks() if _output_task_id(row) == task_id), None)
+    task_record_id = str((task or {}).get("record_id", ""))
+    if task_record_id:
+        client.update_task(task_record_id, {FIELD_STATUS: "已完成", "当前阶段": "已完成"})
+
+    revision_record_id = ""
+    revision_record_ids: List[str] = []
+    should_calibrate = bool(_field(review, "是否进画像校准", False))
+    already_summarized = str(_field(review, "归纳状态", "")).strip() == "已归纳"
+    if should_calibrate and client.revision_table and not already_summarized:
+        existing = client.list_records(client.revision_table, client.revision_app_token)
+        existing_by_scope = {
+            str(_field(row, "规则归属", "")).strip(): str(row.get("record_id", "")).strip()
+            for row in existing
+            if str(_field(row, "引用审核记录", "")).strip() == str(review_record_id)
+        }
+        for revision_fields in build_scoped_revision_candidates(review):
+            scope = str(revision_fields.get("规则归属", "")).strip()
+            existing_id = existing_by_scope.get(scope, "")
+            if existing_id:
+                revision_record_ids.append(existing_id)
+                continue
+            new_id = client.create_record(
+                client.revision_table, revision_fields, client.revision_app_token
+            )
+            if new_id:
+                client.update_record(
+                    client.revision_table, new_id, {"候选ID": new_id}, client.revision_app_token
+                )
+                revision_record_ids.append(new_id)
+        revision_record_id = revision_record_ids[0] if revision_record_ids else ""
+    review_completed_at = int(now_ms if now_ms is not None else time.time() * 1000)
+    review_started_at = _field(review, "审核开始时间", _field(review, "审核时间", ""))
+    try:
+        review_elapsed_minutes = round(max(0, review_completed_at - int(review_started_at)) / 60000.0, 3)
+    except (TypeError, ValueError):
+        review_elapsed_minutes = None
+    completion_fields: Dict[str, Any] = {
+        "归纳状态": "已归纳",
+        "飞书任务状态": "已完成",
+        "审核完成时间": review_completed_at,
+    }
+    if review_elapsed_minutes is not None:
+        completion_fields["审核流转耗时分钟"] = review_elapsed_minutes
+    client.update_record(
+        client.review_table,
+        str(review_record_id),
+        completion_fields,
+        client.review_app_token,
+    )
+    return {
+        "task_record_id": task_record_id,
+        "review_record_id": str(review_record_id),
+        "revision_record_id": revision_record_id,
+        "revision_record_ids": ",".join(revision_record_ids),
+    }
+
+
+def sync_metrics_snapshot(
+    client: Optional[FeishuBitableClient] = None,
+    automation_events: Optional[Iterable[Dict[str, Any]]] = None,
+) -> str:
+    """Upsert the latest honest competition metrics into one Feishu row."""
+    client = client or _make_client()
+    metrics_table = getattr(client, "metrics_table", "")
+    if not metrics_table:
+        raise RuntimeError("缺少 FEISHU_METRICS_TABLE_ID 指标表配置")
+    if automation_events is None:
+        automation_events = _read_jsonl(
+            os.environ.get(
+                "FEISHU_AUTOMATION_LEDGER",
+                os.path.join(BASE_DIR, ".cache", "feishu_automation_events.jsonl"),
+            )
+        )
+    reviews = client.list_records(client.review_table, client.review_app_token) if client.review_table else []
+    revisions = client.list_records(client.revision_table, client.revision_app_token) if client.revision_table else []
+    metrics = summarize_feishu_business_metrics(
+        client.list_tasks(),
+        reviews,
+        revisions,
+        outputs=client.list_outputs(),
+        automation_events=automation_events,
+    )
+    workflow = metrics["workflow"]
+    automation = metrics["automation"]
+    review = metrics["review"]
+    outcomes = review["outcomes"]
+    def percent_text(value: Any) -> str:
+        try:
+            return f"{float(value or 0) * 100:.1f}%"
+        except (TypeError, ValueError):
+            return "0.0%"
+    fields = {
+        "指标快照": "当前比赛指标",
+        "生成时间": int(time.time() * 1000),
+        "任务总数": workflow["tasks"],
+        "结果总数": workflow["outputs"],
+        "自动化排队数": automation["queued"],
+        "自动化完成数": automation["completed"],
+        "自动化失败数": automation["failed"],
+        "自动化完成率": automation["completion_rate"] or 0,
+        "自动化完成率展示": percent_text(automation["completion_rate"]),
+        "AI耗时中位数秒": automation["median_duration_seconds"] or 0,
+        "审核总数": review["total"],
+        "已完成审核数": review["completed"],
+        "审核完成率": review["completion_rate"] or 0,
+        "审核完成率展示": percent_text(review["completion_rate"]),
+        "直接采纳数": outcomes["直接采纳"],
+        "小幅修改数": outcomes["小幅修改"],
+        "大幅修改数": outcomes["大幅修改"],
+        "废弃数": outcomes["废弃"],
+        "推荐采纳率": metrics["recommendation"]["adoption_rate"] or 0,
+        "推荐采纳率展示": percent_text(metrics["recommendation"]["adoption_rate"]),
+        "配对效率样本数": metrics["efficiency"]["paired_samples"],
+        "节省时间中位数分钟": metrics["efficiency"]["median_minutes_saved"] or 0,
+        "确认风险数": metrics["risk"]["human_confirmed"],
+        "画像修订候选数": metrics["feedback"]["revision_candidates"],
+        "证据口径": "；".join(metrics["limitations"]),
+    }
+    existing = client.list_records(metrics_table, client.metrics_app_token)
+    current = next((row for row in existing if str(_field(row, "指标快照", "")) == "当前比赛指标"), None)
+    if current:
+        record_id = str(current.get("record_id", ""))
+        client.update_record(metrics_table, record_id, fields, client.metrics_app_token)
+        return record_id
+    return client.create_record(metrics_table, fields, client.metrics_app_token)
 
 
 def _process_one_task(
@@ -597,25 +1195,34 @@ def _process_one_task(
 ) -> Optional[Dict[str, Any]]:
     checkpoint = checkpoint_store.load(task)
     if existing:
-        ensure_review_record(
+        review_record_id = ensure_review_record(
             client,
             str(existing.get("record_id", "")),
             _review_source_fields(existing.get("fields", existing), (checkpoint or {}).get("run_snapshot")),
+            task_context=task,
         )
+        ensure_candidate_records(client, str(existing.get("record_id", "")), existing.get("fields", existing))
         if checkpoint and not checkpoint.get("output_written"):
             checkpoint_store.mark_output_written(task, str(existing.get("record_id", "")))
-        output_status = str(_field(existing, "系统状态", "")).strip().lower()
-        client.update_task(task["record_id"], {FIELD_STATUS: "异常" if output_status == "error" else "待审核"})
+        client.update_task(task["record_id"], _task_completion_fields(
+            str(existing.get("record_id", "")), existing.get("fields", existing),
+            (checkpoint or {}).get("run_snapshot"), review_record_id,
+        ))
         return
 
     if checkpoint and checkpoint.get("output_written"):
         result = checkpoint.get("result") or {"final_status": "error"}
-        ensure_review_record(
+        review_record_id = ensure_review_record(
             client,
             str(checkpoint.get("output_record_id", "")),
             _review_source_fields(checkpoint.get("fields") or {}, checkpoint.get("run_snapshot")),
+            task_context=task,
         )
-        client.update_task(task["record_id"], {FIELD_STATUS: _task_result_status(result)})
+        ensure_candidate_records(client, str(checkpoint.get("output_record_id", "")), checkpoint.get("fields") or {})
+        client.update_task(task["record_id"], _task_completion_fields(
+            str(checkpoint.get("output_record_id", "")), checkpoint.get("fields") or {},
+            checkpoint.get("run_snapshot"), review_record_id,
+        ))
         return
 
     if checkpoint:
@@ -623,7 +1230,8 @@ def _process_one_task(
         fields = checkpoint.get("fields") or build_output(task, result)
         run_snapshot = checkpoint.get("run_snapshot") or {}
     else:
-        client.update_task(task["record_id"], {FIELD_STATUS: "生成中"})
+        generation_started_at = int(time.time() * 1000)
+        client.update_task(task["record_id"], {FIELD_STATUS: "生成中", "当前阶段": "AI生成中", "异常摘要": ""})
         generation_started = time.monotonic()
         result = localize(
             str(_field(task, FIELD_SOURCE)).strip(),
@@ -638,11 +1246,18 @@ def _process_one_task(
             _merge_package_fields(fields, package)
             run_snapshot = package["run_snapshot"]
         run_snapshot["ai_total_seconds"] = round(time.monotonic() - generation_started, 3)
+        generation_completed_at = int(time.time() * 1000)
+        fields["生成开始时间"] = generation_started_at
+        fields["生成完成时间"] = generation_completed_at
+        fields["AI总耗时秒"] = run_snapshot["ai_total_seconds"]
         checkpoint = checkpoint_store.save_generated(task, result, fields, run_snapshot=run_snapshot)
 
     output_record_id = client.create_output(fields)
     checkpoint_store.mark_output_written(task, output_record_id)
-    ensure_review_record(client, output_record_id, _review_source_fields(fields, run_snapshot))
+    review_record_id = ensure_review_record(
+        client, output_record_id, _review_source_fields(fields, run_snapshot), task_context=task
+    )
+    ensure_candidate_records(client, output_record_id, fields)
     if run_snapshot.get("schema_version"):
         append_run_snapshot(run_snapshot)
     return result
@@ -664,7 +1279,22 @@ def run_live(
     output_app = os.environ.get("FEISHU_OUTPUT_APP_TOKEN", app_token)
     if not all((app_token, task_table, output_table)):
         raise RuntimeError("缺少飞书表格配置")
-    client = client or FeishuBitableClient(app_token, task_table, output_table, output_app)
+    client = client or FeishuBitableClient(
+        app_token,
+        task_table,
+        output_table,
+        output_app,
+        review_table=os.environ.get("FEISHU_REVIEW_TABLE_ID", ""),
+        revision_table=os.environ.get("FEISHU_REVISION_TABLE_ID", ""),
+        candidate_table=os.environ.get("FEISHU_CANDIDATE_TABLE_ID", ""),
+        event_table=os.environ.get("FEISHU_EVENT_TABLE_ID", ""),
+        metrics_table=os.environ.get("FEISHU_METRICS_TABLE_ID", ""),
+        review_app_token=os.environ.get("FEISHU_REVIEW_APP_TOKEN", output_app),
+        revision_app_token=os.environ.get("FEISHU_REVISION_APP_TOKEN", output_app),
+        candidate_app_token=os.environ.get("FEISHU_CANDIDATE_APP_TOKEN", output_app),
+        event_app_token=os.environ.get("FEISHU_EVENT_APP_TOKEN", output_app),
+        metrics_app_token=os.environ.get("FEISHU_METRICS_APP_TOKEN", output_app),
+    )
     checkpoint_store = checkpoint_store or CheckpointStore()
     output_records = client.list_outputs()
     existing_outputs = {
@@ -693,7 +1323,20 @@ def run_live(
                 raise
             continue
         if result is not None:
-            client.update_task(task["record_id"], {FIELD_STATUS: _task_result_status(result)})
+            checkpoint = checkpoint_store.load(task) or {}
+            output_record_id = str(checkpoint.get("output_record_id", ""))
+            fields = checkpoint.get("fields") or build_output(task, result)
+            review_record_id = ""
+            if getattr(client, "review_table", "") and output_record_id:
+                reviews = client.list_records(client.review_table, client.review_app_token)
+                review_record_id = next((
+                    str(review.get("record_id", ""))
+                    for review in reviews
+                    if str(_field(review, "产出ID", "")).strip() == output_record_id
+                ), "")
+            client.update_task(task["record_id"], _task_completion_fields(
+                output_record_id, fields, checkpoint.get("run_snapshot"), review_record_id,
+            ))
     print(f"飞书处理完成：{len(tasks)} 条待生成任务")
     return 0
 
@@ -712,8 +1355,14 @@ def _make_client() -> FeishuBitableClient:
         output_app,
         review_table=os.environ.get("FEISHU_REVIEW_TABLE_ID", ""),
         revision_table=os.environ.get("FEISHU_REVISION_TABLE_ID", ""),
+        candidate_table=os.environ.get("FEISHU_CANDIDATE_TABLE_ID", ""),
+        event_table=os.environ.get("FEISHU_EVENT_TABLE_ID", ""),
+        metrics_table=os.environ.get("FEISHU_METRICS_TABLE_ID", ""),
         review_app_token=os.environ.get("FEISHU_REVIEW_APP_TOKEN", output_app),
         revision_app_token=os.environ.get("FEISHU_REVISION_APP_TOKEN", output_app),
+        candidate_app_token=os.environ.get("FEISHU_CANDIDATE_APP_TOKEN", output_app),
+        event_app_token=os.environ.get("FEISHU_EVENT_APP_TOKEN", output_app),
+        metrics_app_token=os.environ.get("FEISHU_METRICS_APP_TOKEN", output_app),
     )
 
 
@@ -822,6 +1471,8 @@ def apply_revisions(client: FeishuBitableClient, market: Optional[str] = None) -
     adopted = [
         r for r in client.list_records(client.revision_table, client.revision_app_token)
         if str(_field(r, "状态", "")).strip() == "已采纳"
+        and str(_field(r, "规则归属", "")).strip() != "工程规则"
+        and _field(r, "允许画像回灌", True) is not False
     ]
     if market:
         adopted = [r for r in adopted if str(_field(r, "目标市场", "")).strip().lower() == market.lower()]

@@ -58,8 +58,11 @@ def _process_one(creative, market_code, brand, with_baseline):
             a_result = {"copy": "", "_error": str(e)}
 
     # 严格配对：A和B都非空且B非error才一起进盲测
-    b_ok = b_result and b_result.get("copy") and b_result.get("final_status") != "error"
-    a_ok = a_result and a_result.get("copy") if with_baseline else True
+    b_ok = bool(b_result) and bool(b_result.get("copy")) and b_result.get("final_status") != "error"
+    if with_baseline:
+        a_ok = bool(a_result) and bool(a_result.get("copy"))
+    else:
+        a_ok = True
 
     if with_baseline and a_ok and b_ok:
         blind_items.append({

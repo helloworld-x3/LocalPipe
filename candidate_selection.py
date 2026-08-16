@@ -11,6 +11,12 @@ SELECTION_WEIGHTS = {
     "route_distinctiveness": 0.05,
 }
 
+# 确定性择优阈值与不确定性分档（与 pipeline.FIDELITY_THRESHOLD 一致的默认保真门槛）
+DEFAULT_FIDELITY_THRESHOLD = 0.7
+# 前两名总分差分档：< HIGH 为高不确定性（强制人工），< MEDIUM 为中（mandatory），否则低（sample）
+UNCERTAINTY_MARGIN_HIGH = 0.03
+UNCERTAINTY_MARGIN_MEDIUM = 0.08
+
 _TABOO_SAFETY = {"low": 1.0, "medium": 0.4, "high": 0.0}
 _ROUTE_DISTINCTIVENESS = {
     "product_proof": 0.90,
@@ -46,7 +52,7 @@ def _cultural_alignment(fidelity):
     return 1.0
 
 
-def evaluate_candidate(candidate, threshold=0.7):
+def evaluate_candidate(candidate, threshold=DEFAULT_FIDELITY_THRESHOLD):
     """Return an evaluated copy with auditable score components and hard gates."""
     evaluated = deepcopy(candidate) if isinstance(candidate, dict) else {}
     fidelity = evaluated.get("fidelity") or {}
@@ -101,7 +107,7 @@ def evaluate_candidate(candidate, threshold=0.7):
     return evaluated
 
 
-def rank_candidates(candidates, threshold=0.7):
+def rank_candidates(candidates, threshold=DEFAULT_FIDELITY_THRESHOLD):
     """Evaluate and rank candidates, keeping input order for exact ties."""
     evaluated = [evaluate_candidate(candidate, threshold) for candidate in (candidates or [])]
     ranked = sorted(
@@ -115,7 +121,7 @@ def rank_candidates(candidates, threshold=0.7):
     return result
 
 
-def build_selection_decision(candidates, threshold=0.7):
+def build_selection_decision(candidates, threshold=DEFAULT_FIDELITY_THRESHOLD):
     """Select the best eligible candidate and derive uncertainty/review policy."""
     ranked = rank_candidates(candidates, threshold)
     eligible = [candidate for candidate in ranked if candidate["eligible"]]
@@ -132,9 +138,9 @@ def build_selection_decision(candidates, threshold=0.7):
         }
     else:
         margin = eligible[0]["score"] - eligible[1]["score"]
-        if margin < 0.03:
+        if margin < UNCERTAINTY_MARGIN_HIGH:
             level = "high"
-        elif margin < 0.08:
+        elif margin < UNCERTAINTY_MARGIN_MEDIUM:
             level = "medium"
         else:
             level = "low"

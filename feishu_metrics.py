@@ -43,6 +43,20 @@ def _rounded_median(values: List[float]) -> Optional[float]:
     return round(float(median(values)), 3) if values else None
 
 
+def _review_outcome(value: Any) -> str:
+    normalized = str(value or "").strip()
+    return {
+        "直接采纳": "直接采纳",
+        "采纳": "直接采纳",
+        "小改": "小幅修改",
+        "小幅修改": "小幅修改",
+        "大改": "大幅修改",
+        "大幅修改": "大幅修改",
+        "废弃": "废弃",
+        "淘汰": "废弃",
+    }.get(normalized, "")
+
+
 def summarize_feishu_business_metrics(
     tasks: Iterable[Dict[str, Any]],
     reviews: Iterable[Dict[str, Any]],
@@ -63,9 +77,8 @@ def summarize_feishu_business_metrics(
     ]
     outcome_names = ("直接采纳", "小幅修改", "大幅修改", "废弃")
     outcomes = Counter(
-        str(row.get("修改程度", "")).strip()
-        for row in completed_reviews
-        if str(row.get("修改程度", "")).strip() in outcome_names
+        outcome for row in completed_reviews
+        if (outcome := _review_outcome(row.get("修改程度")))
     )
 
     recommendation_values = [

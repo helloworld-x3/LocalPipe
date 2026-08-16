@@ -124,8 +124,12 @@ class ModelClient:
     def __init__(self, config=None):
         self.config = config or ModelConfig()
         if not self.config.api_key:
-            print("[错误] 未找到 API Key，请在 .env 中设置 DEEPSEEK_API_KEY / DASHSCOPE_API_KEY / OPENAI_API_KEY")
-            sys.exit(1)
+            # 抛异常而非 sys.exit：ModelClient 被 feishu 桥接等宿主进程调用时，
+            # 缺 Key 应让上层容错（任务置"异常"），而不是杀掉整个服务进程。
+            raise RuntimeError(
+                "未找到 API Key，请在 .env 中设置 LLM_API_KEY（优先）"
+                "或 DEEPSEEK_API_KEY / DASHSCOPE_API_KEY / OPENAI_API_KEY"
+            )
         self.client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url)
 
     def chat_stream(self, messages, tools=None):

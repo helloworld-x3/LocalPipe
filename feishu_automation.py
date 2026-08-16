@@ -24,7 +24,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Mapping, Optional
 
-from feishu_connector import run_live
+from feishu_connector import FeishuBitableClient, complete_review, run_live, sync_metrics_snapshot
 
 
 def extract_record_id(payload: Any) -> str:
@@ -48,6 +48,22 @@ def extract_challenge(payload: Any) -> str:
     if isinstance(payload, dict) and isinstance(payload.get("challenge"), str):
         return payload["challenge"]
     return ""
+
+
+def extract_action(payload: Any) -> str:
+    """Extract a safe Feishu command; legacy payloads default to generation."""
+    if not isinstance(payload, dict):
+        return "generate"
+    value = payload.get("action")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    for container_key in ("data", "event", "body", "payload"):
+        nested = payload.get(container_key)
+        if isinstance(nested, dict):
+            action = extract_action(nested)
+            if action != "generate" or "action" in nested:
+                return action
+    return "generate"
 
 
 def provided_token(headers: Mapping[str, str], payload: Any = None) -> str:
@@ -84,17 +100,81 @@ def append_automation_event(event: Dict[str, Any], path: Optional[Path] = None) 
     return target
 
 
+def append_feishu_event(event: Dict[str, Any]) -> str:
+    """Mirror a sanitized automation event into the optional Feishu event table."""
+    event_table = os.environ.get("FEISHU_EVENT_TABLE_ID", "")
+    if not event_table:
+        return ""
+    app_token = os.environ.get("FEISHU_APP_TOKEN", "")
+    task_table = os.environ.get("FEISHU_TASK_TABLE_ID", "")
+    output_table = os.environ.get("FEISHU_OUTPUT_TABLE_ID", "")
+    output_app = os.environ.get("FEISHU_OUTPUT_APP_TOKEN", app_token)
+    event_app = os.environ.get("FEISHU_EVENT_APP_TOKEN", app_token)
+    if not all((app_token, task_table, output_table)):
+        return ""
+    client = FeishuBitableClient(
+        app_token,
+        task_table,
+        output_table,
+        output_app,
+        event_table=event_table,
+        event_app_token=event_app,
+    )
+    occurred_at = int(time.time() * 1000)
+    fields = {
+        "任务记录ID": str(event.get("record_id", "")),
+        "事件类型": str(event.get("event", "")),
+        "耗时秒": round(float(event.get("duration_ms", 0) or 0) / 1000.0, 3),
+        "错误类型": str(event.get("error_type", "")),
+        "说明": {
+            "queued": "任务进入 LocalPipe 执行队列",
+            "completed": "LocalPipe 执行完成并写回飞书",
+            "duplicate": "重复触发已被幂等保护拦截",
+            "failed": "后台执行失败，未写入原始异常详情",
+        }.get(str(event.get("event", "")), ""),
+        "发生时间": occurred_at,
+    }
+    event_id = client.create_record(event_table, fields, event_app)
+    if event_id:
+        client.update_record(event_table, event_id, {"事件ID": event_id}, event_app)
+    return event_id
+
+
+def build_live_event_logger(
+    local_logger: Callable[[Dict[str, Any]], Any] = append_automation_event,
+    feishu_logger: Callable[[Dict[str, Any]], Any] = append_feishu_event,
+) -> Callable[[Dict[str, Any]], None]:
+    """Keep local evidence complete while only sending a safe subset to Feishu."""
+    def log(event: Dict[str, Any]) -> None:
+        local_logger(event)
+        sanitized = {
+            key: event[key]
+            for key in ("event", "action", "record_id", "duration_ms", "error_type")
+            if key in event
+        }
+        try:
+            feishu_logger(sanitized)
+        except Exception:
+            pass
+
+    return log
+
+
 class AutomationService:
     """Deduplicating asynchronous dispatcher for automation callbacks."""
 
     def __init__(
         self,
         runner: Optional[Callable[[str], Any]] = None,
+        review_runner: Optional[Callable[[str], Any]] = None,
+        metrics_runner: Optional[Callable[[], Any]] = None,
         event_logger: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ):
         uses_live_runner = runner is None
         self.runner = runner or (lambda record_id: run_live(task_record_id=record_id))
-        self.event_logger = event_logger or (append_automation_event if uses_live_runner else (lambda event: None))
+        self.review_runner = review_runner or complete_review
+        self.metrics_runner = metrics_runner or sync_metrics_snapshot
+        self.event_logger = event_logger or (build_live_event_logger() if uses_live_runner else (lambda event: None))
         self._active = set()
         self._completed: Dict[str, float] = {}
         self._lock = threading.Lock()
@@ -108,31 +188,44 @@ class AutomationService:
             pass
 
     def submit(self, record_id: str) -> Dict[str, Any]:
+        return self.submit_action("generate", record_id)
+
+    def submit_action(self, action: str, record_id: str = "") -> Dict[str, Any]:
+        action = str(action or "generate").strip()
+        if action not in {"generate", "complete_review", "sync_metrics"}:
+            return {"accepted": False, "status": "invalid_action", "error": "unsupported action"}
         record_id = str(record_id or "").strip()
-        if not record_id:
+        if action != "sync_metrics" and not record_id:
             return {"accepted": False, "status": "invalid", "error": "missing record_id"}
+        dedupe_key = record_id if action == "generate" else f"{action}:{record_id or 'global'}"
         with self._lock:
             now = time.time()
             for rid in [r for r, ts in self._completed.items() if now - ts > COMPLETED_TTL]:
                 self._completed.pop(rid, None)
-            if record_id in self._active or record_id in self._completed:
-                self._log_event({"event": "duplicate", "record_id": record_id})
-                return {"accepted": True, "status": "duplicate", "record_id": record_id}
-            self._active.add(record_id)
-        self._log_event({"event": "queued", "record_id": record_id})
-        thread = threading.Thread(target=self._execute, args=(record_id,), daemon=True)
+            if dedupe_key in self._active or dedupe_key in self._completed:
+                self._log_event({"event": "duplicate", "action": action, "record_id": record_id})
+                return {"accepted": True, "status": "duplicate", "action": action, "record_id": record_id}
+            self._active.add(dedupe_key)
+        self._log_event({"event": "queued", "action": action, "record_id": record_id})
+        thread = threading.Thread(target=self._execute, args=(action, record_id, dedupe_key), daemon=True)
         thread.start()
-        return {"accepted": True, "status": "queued", "record_id": record_id}
+        return {"accepted": True, "status": "queued", "action": action, "record_id": record_id}
 
-    def _execute(self, record_id: str) -> None:
+    def _execute(self, action: str, record_id: str, dedupe_key: str) -> None:
         started = time.monotonic()
         try:
             with self._semaphore:
-                self.runner(record_id)
+                if action == "generate":
+                    self.runner(record_id)
+                elif action == "complete_review":
+                    self.review_runner(record_id)
+                else:
+                    self.metrics_runner()
             with self._lock:
-                self._completed[record_id] = time.time()
+                self._completed[dedupe_key] = time.time()
             self._log_event({
                 "event": "completed",
+                "action": action,
                 "record_id": record_id,
                 "duration_ms": round((time.monotonic() - started) * 1000),
             })
@@ -140,13 +233,14 @@ class AutomationService:
             self.last_error = f"{type(exc).__name__}: {exc}"
             self._log_event({
                 "event": "failed",
+                "action": action,
                 "record_id": record_id,
                 "duration_ms": round((time.monotonic() - started) * 1000),
                 "error_type": type(exc).__name__,
             })
         finally:
             with self._lock:
-                self._active.discard(record_id)
+                self._active.discard(dedupe_key)
 
 
 class FeishuAutomationHandler(BaseHTTPRequestHandler):
@@ -161,6 +255,13 @@ class FeishuAutomationHandler(BaseHTTPRequestHandler):
         ip = self.address_string()
         now = time.time()
         with self._challenge_lock:
+            # 惰性清理窗口期外的 IP 记录，避免长期运行内存缓慢增长
+            stale = [
+                key for key, ts in self._challenge_times.items()
+                if now - ts > self._challenge_window
+            ]
+            for key in stale:
+                self._challenge_times.pop(key, None)
             last = self._challenge_times.get(ip, 0.0)
             if now - last < self._challenge_window / self._challenge_max:
                 return False
@@ -223,7 +324,7 @@ class FeishuAutomationHandler(BaseHTTPRequestHandler):
             return
 
         record_id = extract_record_id(payload)
-        response = self.service.submit(record_id)
+        response = self.service.submit_action(extract_action(payload), record_id)
         self._write_json(HTTPStatus.ACCEPTED if response.get("accepted") else HTTPStatus.BAD_REQUEST, response)
 
     def log_message(self, format: str, *args: Any) -> None:
