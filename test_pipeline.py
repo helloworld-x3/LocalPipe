@@ -2469,6 +2469,23 @@ class TestFeishuClosedLoop(unittest.TestCase):
             time.sleep(0.001)
         self.assertEqual(started, ["rec-log-fail"])
 
+    def test_automation_service_marks_failed_generation_task_as_exception(self):
+        import time
+        from feishu_automation import AutomationService
+
+        failures = []
+        service = AutomationService(
+            runner=lambda record_id: (_ for _ in ()).throw(RuntimeError("private detail")),
+            failure_handler=lambda record_id, error_type: failures.append((record_id, error_type)),
+        )
+        service.submit("rec-stuck")
+        for _ in range(100):
+            if failures:
+                break
+            time.sleep(0.001)
+
+        self.assertEqual(failures, [("rec-stuck", "RuntimeError")])
+
     def test_live_automation_event_logger_writes_local_and_feishu_without_leaking_details(self):
         from feishu_automation import build_live_event_logger
 

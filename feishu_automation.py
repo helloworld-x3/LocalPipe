@@ -52,6 +52,15 @@ def task_waiting_for_generation(record_id: str) -> bool:
     return str(fields.get(FIELD_STATUS, "")).strip() == "待生成"
 
 
+def mark_generation_failed(record_id: str, error_type: str) -> None:
+    """Expose background failures in the task table without leaking details."""
+    _make_client().update_task(str(record_id), {
+        FIELD_STATUS: "异常",
+        "当前阶段": "异常",
+        "异常摘要": f"自动生成失败（{str(error_type or 'Error')}），请重新提交",
+    })
+
+
 def extract_record_id(payload: Any) -> str:
     """Extract a Bitable record ID from common Feishu Automation payloads."""
     if not isinstance(payload, dict):
@@ -235,6 +244,7 @@ class AutomationService:
         query_runner: Optional[Callable[[str], Dict[str, Any]]] = None,
         event_logger: Optional[Callable[[Dict[str, Any]], Any]] = None,
         retry_checker: Optional[Callable[[str], bool]] = None,
+        failure_handler: Optional[Callable[[str, str], Any]] = None,
     ):
         uses_live_runner = runner is None
         self.runner = runner or (lambda record_id: run_live(task_record_id=record_id))
@@ -243,6 +253,7 @@ class AutomationService:
         self.query_runner = query_runner or (lambda task_id: query_task_summary(_make_client(), task_id))
         self.event_logger = event_logger or (build_live_event_logger() if uses_live_runner else (lambda event: None))
         self.retry_checker = retry_checker or (task_waiting_for_generation if uses_live_runner else None)
+        self.failure_handler = failure_handler or (mark_generation_failed if uses_live_runner else None)
         self._active = set()
         self._completed: Dict[str, float] = {}
         self._lock = threading.Lock()
@@ -311,6 +322,11 @@ class AutomationService:
             })
         except Exception as exc:  # pragma: no cover - surfaced through logs/health
             self.last_error = f"{type(exc).__name__}: {exc}"
+            if action == "generate" and self.failure_handler is not None:
+                try:
+                    self.failure_handler(record_id, type(exc).__name__)
+                except Exception:
+                    pass
             self._log_event({
                 "event": "failed",
                 "action": action,
