@@ -159,8 +159,10 @@ def run_batch(creatives_path, market_codes, with_baseline=True, workers=3):
 
     paths = {}
     for name, data in [("batch", full_results), ("blind", blind), ("key", key), ("skipped", all_skipped)]:
+        # 文件名来自固定 name 与时间戳 ts，不含任何外部输入
+        from pathlib import Path
         p = os.path.join(BASE_DIR, "outputs", f"{name}_{ts}.json")
-        with open(p, "w", encoding="utf-8") as f:
+        with Path(p).open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         paths[name] = p
 

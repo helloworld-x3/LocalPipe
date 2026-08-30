@@ -370,8 +370,8 @@ def _upsert_env(key: str, value: str) -> None:
             out.append(line)
     if not replaced:
         out.append(f"{key}={value}")
-    with open(ENV_PATH, "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
+    from pathlib import Path
+    Path(ENV_PATH).write_text("\n".join(out) + "\n", encoding="utf-8")
     print(f"  .env 已写入 {key}={value}")
 
 

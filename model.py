@@ -7,7 +7,7 @@ import sys
 import json
 import time
 import threading
-import warnings
+from pathlib import Path
 
 MAX_RETRIES = 2
 
@@ -76,9 +76,11 @@ def sanitize_user_input(text):
     for pat in _INJECTION_PATTERNS:
         if re.search(pat, text, re.IGNORECASE):
             # 2026-07-25 安全审计修复：原 raise ValueError 会误杀正常文案
-# （如"不要忘记领取优惠券"），且纯英文注入可绕过中文正则。
-# 主防线 XML 结构隔离已足够，正则仅作预警日志。
-            warnings.warn(f"输入包含疑似指令注入内容（PAT={pat[:40]}...），已记录但不阻断")
+            # （如"不要忘记领取优惠券"），且纯英文注入可绕过中文正则。
+            # 主防线 XML 结构隔离已足够，正则仅作预警日志。
+            # 2026-08-30：改走 safe_print（stderr 的 warnings 不经过
+            # ANSI 剥离，用户输入可在远程日志聚合中注入伪行）
+            safe_print(f"  [注入预警] 输入包含疑似指令注入内容（PAT={pat[:40]}...），已记录但不阻断", file=sys.stderr)
 
     # 主防线：迭代清除分隔符 token（防嵌套/拼接绕过），直到稳定
     sanitized = text
@@ -223,16 +225,17 @@ class ModelClient:
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
-def safe_print(*args, end="\n", flush=False, **kwargs):
+def safe_print(*args, end="\n", flush=False, file=None, **kwargs):
     """GBK 安全打印（剥离 ANSI 转义，防 LLM 输出操纵终端）"""
+    stream = file or sys.stdout
     text = " ".join(str(a) for a in args) + end
     text = _ANSI_RE.sub("", text)
     try:
-        sys.stdout.write(text.encode("gbk", errors="replace").decode("gbk"))
+        stream.write(text.encode("gbk", errors="replace").decode("gbk"))
     except Exception:
-        sys.stdout.write(text)
-    if flush:
-        sys.stdout.flush()
+        stream.write(text)
+    if flush or file is sys.stderr:
+        stream.flush()
 
 
 # ========== LLM 响应缓存 ==========
@@ -285,7 +288,7 @@ class Cache:
                 keys = sorted(self._data, key=lambda k: self._data[k]["ts"], reverse=True)
                 self._data = {k: self._data[k] for k in keys[:self._max_entries]}
             os.makedirs(self.cache_dir, exist_ok=True)
-            with open(self.cache_file, "w", encoding="utf-8") as f:
+            with Path(self.cache_file).open("w", encoding="utf-8") as f:
                 json.dump(self._data, f, ensure_ascii=False, indent=2)
 
 

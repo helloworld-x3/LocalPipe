@@ -115,8 +115,14 @@ def extract_action(payload: Any) -> str:
     return "generate"
 
 
-def provided_token(headers: Mapping[str, str], payload: Any = None) -> str:
-    """Read the bridge token from headers or an optional payload field."""
+def provided_token(headers: Mapping[str, str]) -> str:
+    """Read the bridge token from request headers only.
+
+    2026-08-30 安全修复：移除从 payload ``token`` 字段读取的通道。请求体
+    会被网关/代理/自动化平台日志原样记录，token 出现在 body 中等于明文
+    落盘；Header 通道（自定义 Header 或 Authorization: Bearer）不进常规
+    访问日志。Feishu Automation 的 HTTP 请求节点支持自定义 Header。
+    """
     for name in ("X-LocalPipe-Token", "X-Feishu-Token", "X-Webhook-Token"):
         value = headers.get(name, "")
         if value:
@@ -124,10 +130,6 @@ def provided_token(headers: Mapping[str, str], payload: Any = None) -> str:
     authorization = headers.get("Authorization", "")
     if authorization.lower().startswith("bearer "):
         return authorization[7:].strip()
-    if isinstance(payload, dict):
-        value = payload.get("token")
-        if isinstance(value, str):
-            return value.strip()
     return ""
 
 
@@ -344,25 +346,37 @@ class FeishuAutomationHandler(BaseHTTPRequestHandler):
 
     _challenge_lock = threading.Lock()
     _challenge_times: Dict[str, float] = {}
+    _query_times: Dict[str, float] = {}
     _challenge_window = 60.0
     _challenge_max = 10
+    # /query 每次同步拉全量任务/结果/候选表，放大成飞书 API 消耗；限频防轮询
+    _query_window = 10.0
+    _query_max = 5
 
-    def _challenge_allowed(self) -> bool:
+    def _rate_allowed(self, times: Dict[str, float], window: float, max_hits: int) -> bool:
+        """滑动窗口计数限频：允许瞬时 max_hits 连发，窗口内超出才拒绝。
+
+        2026-08-30 修正：先前实现（窗口/max_hits 作为最小间隔）会把合法的
+        紧凑连续调用也拦掉——鉴权后的自动化回调完全可能 1 秒内查两次。
+        改为标准滑动窗口：窗口内第 max_hits+1 次请求才 429。
+        """
         ip = self.address_string()
         now = time.time()
         with self._challenge_lock:
-            # 惰性清理窗口期外的 IP 记录，避免长期运行内存缓慢增长
-            stale = [
-                key for key, ts in self._challenge_times.items()
-                if now - ts > self._challenge_window
-            ]
-            for key in stale:
-                self._challenge_times.pop(key, None)
-            last = self._challenge_times.get(ip, 0.0)
-            if now - last < self._challenge_window / self._challenge_max:
+            cutoff = now - window
+            if times.get(ip) and times[ip][0] <= cutoff:
+                times.pop(ip, None)
+            hits = times.get(ip, [])
+            if len(hits) >= max_hits:
                 return False
-            self._challenge_times[ip] = now
+            times[ip] = hits + [now]
             return True
+
+    def _challenge_allowed(self) -> bool:
+        return self._rate_allowed(self._challenge_times, self._challenge_window, self._challenge_max)
+
+    def _query_allowed(self) -> bool:
+        return self._rate_allowed(self._query_times, self._query_window, self._query_max)
 
     @property
     def service(self) -> AutomationService:
@@ -415,12 +429,17 @@ class FeishuAutomationHandler(BaseHTTPRequestHandler):
         if not self.expected_token:
             self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False, "error": "server not configured with a token"})
             return
-        provided = provided_token(self.headers, payload)
+        provided = provided_token(self.headers)
         if not hmac.compare_digest(provided.encode("utf-8"), str(self.expected_token).encode("utf-8")):
             self._write_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "invalid token"})
             return
 
         if path == "/query":
+            # 限频放在 token 校验之后：未鉴权请求不消耗配额，
+            # 否则攻击者可打满同出口 IP 的合法调用方
+            if not self._query_allowed():
+                self._write_json(HTTPStatus.TOO_MANY_REQUESTS, {"ok": False, "error": "too many requests"})
+                return
             task_id = extract_task_id(payload)
             if not task_id:
                 self._write_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing task_id"})
@@ -463,7 +482,7 @@ def main() -> int:
     args = parser.parse_args()
     server = create_server(args.host, args.port)
     print(f"LocalPipe 飞书自动化桥接已启动: http://{args.host}:{args.port}/trigger")
-    print("只读查询: /query；健康检查: /health；生产环境请通过 HTTPS 反向代理暴露，并配置 FEISHU_AUTOMATION_TOKEN")
+    print("只读查询: /query；健康检查: /health；生产环境请通过 HTTPS 反向代理暴露，并配置 FEISHU_AUTOMATION_TOKEN（仅经 Header 传输）")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

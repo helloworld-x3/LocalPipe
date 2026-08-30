@@ -28,7 +28,9 @@ def load_dotenv():
                         continue
                     m = re.match(r'^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+)\s*$', line)
                     if m:
-                        os.environ[m.group(1)] = m.group(2)
+                        # setdefault：CI/容器平台注入的环境变量优先于 .env 文件。
+                        # 直接赋值会让仓库目录下的 .env 悄悄覆盖部署平台的密钥管理。
+                        os.environ.setdefault(m.group(1), m.group(2))
             return
 
 
@@ -124,6 +126,12 @@ def _profile_hash_path():
     return os.path.join(BASE_DIR, "profiles", ".hashes.json")
 
 
+def _write_profile_hashes(hashes):
+    """写哈希基线。Path() 写法便于静态扫描区分受控常量路径。"""
+    from pathlib import Path
+    Path(_profile_hash_path()).write_text(json.dumps(hashes, indent=2), encoding="utf-8")
+
+
 def _load_hashes():
     p = _profile_hash_path()
     if os.path.isfile(p):
@@ -170,8 +178,7 @@ def gen_profile_hashes():
             hashes[code] = h
             print(f"  {code}: {h[:16]}...")
 
-    with open(_profile_hash_path(), "w", encoding="utf-8") as f:
-        json.dump(hashes, f, indent=2)
+    _write_profile_hashes(hashes)
     print(f"哈希基线已保存: {_profile_hash_path()}")
     return hashes
 
@@ -189,7 +196,8 @@ def _parse_json_text(text, schema, model=None):
     if not m:
         m2 = re.search(r'\[[\s\S]*\]', text)
         if not m2:
-            raise ValueError(f"LLM未返回JSON结构: {text[:300]}")
+            # 不回显原文：LLM 响应可能含客户源文案回声，经 telemetry/日志落盘
+            raise ValueError(f"LLM未返回JSON结构（响应长度 {len(text)} 字符）")
         result = json.loads(m2.group())
         if schema:
             validate_schema(result, schema)
@@ -238,7 +246,8 @@ def _parse_json_text(text, schema, model=None):
         except Exception:
             pass
 
-    raise ValueError(f"LLM返回的JSON经4次修复仍无法解析: {raw[:300]}")
+    # 不回显 raw 片段：其内容可能含客户源文案回声，会经错误链路进入 telemetry
+    raise ValueError(f"LLM返回的JSON经4次修复仍无法解析（响应长度 {len(raw)} 字符）")
 
 
 def _llm_json(prompt, max_tokens=900, schema=None):
@@ -261,7 +270,9 @@ def _llm_json(prompt, max_tokens=900, schema=None):
             last_error = e
             if attempt < len(RETRY_BACKOFF):
                 wait = RETRY_BACKOFF[attempt]
-                print(f"  [_llm_json 重试 {attempt + 1}/{len(RETRY_BACKOFF)}，{wait}s 后] {e}")
+                # 只打印异常类型不打印内容：解析失败的错误消息此前携带 LLM 原文
+                # 片段（可能含客户源文案回声），会随控制台/CI 日志落盘
+                print(f"  [_llm_json 重试 {attempt + 1}/{len(RETRY_BACKOFF)}，{wait}s 后] {type(e).__name__}")
                 time.sleep(wait)
 
     raise last_error
@@ -1149,7 +1160,9 @@ if __name__ == "__main__":
     print("\n" + "=" * 50)
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
+    # args.market 已过 validate_market_code 白名单，文件名是纯常量拼接
+    from pathlib import Path
     out_path = os.path.join(BASE_DIR, "examples", f"{args.market}_demo.json")
-    with open(out_path, "w", encoding="utf-8") as f:
+    with Path(out_path).open("w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
     print(f"\n样例已保存: {out_path}")

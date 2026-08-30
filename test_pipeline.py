@@ -1699,6 +1699,13 @@ class _FakeBitableClient:
 
 
 class TestFeishuClosedLoop(unittest.TestCase):
+    def setUp(self):
+        # HTTP handler 的 IP 限频表是类级状态，跨测试共享会串扰：
+        # 前一个测试的请求记录会把后一个测试的首个请求判成 429
+        from feishu_automation import FeishuAutomationHandler
+        FeishuAutomationHandler._query_times.clear()
+        FeishuAutomationHandler._challenge_times.clear()
+
     def test_candidate_records_add_readable_business_summaries_and_keep_raw_audit(self):
         from feishu_connector import ensure_candidate_records
 
@@ -3183,6 +3190,92 @@ class TestFeishuClosedLoop(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_feishu_automation_token_is_only_accepted_via_header(self):
+        """回归：请求体中的 token 字段必须被拒收（防网关日志泄露）。"""
+        import json
+        from http.client import HTTPConnection
+        from threading import Thread
+        from feishu_automation import AutomationService, create_server
+
+        service = AutomationService(runner=lambda record_id: None)
+        server = create_server("127.0.0.1", 0, service=service, expected_token="secret")
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            # 正确 token 但放在 body：必须 401
+            conn.request("POST", "/trigger", body=json.dumps({
+                "record_id": "rec-token-body", "token": "secret",
+            }), headers={"Content-Type": "application/json"})
+            self.assertEqual(conn.getresponse().status, 401)
+            # 同一 token 经 Header 传输：必须通过
+            conn.request("POST", "/trigger", body=json.dumps({"record_id": "rec-token-body"}),
+                         headers={"Content-Type": "application/json", "X-LocalPipe-Token": "secret"})
+            self.assertEqual(conn.getresponse().status, 202)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_feishu_automation_query_rate_limited_after_quota(self):
+        """回归：/query 超出窗口配额返回 429，且未鉴权请求不消耗配额。"""
+        import json
+        from http.client import HTTPConnection
+        from threading import Thread
+        from feishu_automation import AutomationService, create_server
+
+        service = AutomationService(query_runner=lambda task_id: {"ok": True, "task_id": task_id})
+        server = create_server("127.0.0.1", 0, service=service, expected_token="secret")
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            headers = {"Content-Type": "application/json", "X-LocalPipe-Token": "secret"}
+            # 未鉴权请求不应占用限频配额
+            for _ in range(3):
+                conn.request("POST", "/query", body=json.dumps({"task_id": "A"}))
+                self.assertEqual(conn.getresponse().status, 401)
+            # 配额内（5 次）全部 200
+            for _ in range(5):
+                conn.request("POST", "/query", body=json.dumps({"task_id": "A"}), headers=headers)
+                self.assertEqual(conn.getresponse().status, 200)
+            # 第 6 次：429
+            conn.request("POST", "/query", body=json.dumps({"task_id": "A"}), headers=headers)
+            self.assertEqual(conn.getresponse().status, 429)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_load_dotenv_does_not_override_existing_env(self):
+        """回归：.env 不得覆盖 CI/容器平台已注入的环境变量。"""
+        import tempfile
+        from pathlib import Path
+        import pipeline
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_file = Path(temp_dir) / ".env"
+            env_file.write_text("LP_DOTENV_TEST=from-file\n", encoding="utf-8")
+            old_base, old_parent = pipeline.BASE_DIR, pipeline.PARENT_DIR
+            pipeline.BASE_DIR, pipeline.PARENT_DIR = temp_dir, temp_dir
+            try:
+                with patch.dict(os.environ, {"LP_DOTENV_TEST": "from-shell"}, clear=False):
+                    pipeline.load_dotenv()
+                    self.assertEqual(os.environ["LP_DOTENV_TEST"], "from-shell")
+                os.environ.pop("LP_DOTENV_TEST", None)
+                pipeline.load_dotenv()
+                self.assertEqual(os.environ["LP_DOTENV_TEST"], "from-file")
+            finally:
+                pipeline.BASE_DIR, pipeline.PARENT_DIR = old_base, old_parent
+                os.environ.pop("LP_DOTENV_TEST", None)
+
+    def test_parse_json_error_messages_do_not_echo_llm_output(self):
+        """回归：JSON 解析错误信息不得携带 LLM 原文（可能含客户文案回声）。"""
+        from pipeline import _parse_json_text
+
+        secret_echo = "客户机密文案回声SECRET-ECHO-123"
+        with self.assertRaises(ValueError) as ctx:
+            _parse_json_text(secret_echo, None)
+        self.assertNotIn("SECRET-ECHO-123", str(ctx.exception))
+
     def test_run_live_task_record_filter_writes_only_target_three_candidate_result(self):
         import feishu_connector
         from task_checkpoints import CheckpointStore
@@ -3477,10 +3570,11 @@ class TestFeishuClosedLoop(unittest.TestCase):
         self.assertEqual(status["c-002"], "已采纳")
 
     def test_apply_revisions_to_profile_atomic_write(self):
+        from pathlib import Path
         from review_ai import apply_revisions_to_profile
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "zz.json")
-            with open(path, "w", encoding="utf-8") as f:
+            with Path(path).open("w", encoding="utf-8") as f:
                 json.dump({
                     "market": "测试", "market_code": "zz", "version": "v0.1", "language": "zz",
                     "entries": [
@@ -3514,10 +3608,11 @@ class TestFeishuClosedLoop(unittest.TestCase):
             self.assertFalse(os.path.exists(path + ".tmp"))  # 无临时文件残留
 
     def test_apply_revisions_rejects_entry_without_id(self):
+        from pathlib import Path
         from review_ai import apply_revisions_to_profile
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "zz.json")
-            with open(path, "w", encoding="utf-8") as f:
+            with Path(path).open("w", encoding="utf-8") as f:
                 json.dump({
                     "market": "测试", "market_code": "zz", "version": "v0.1", "language": "zz",
                     "entries": [

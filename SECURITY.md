@@ -95,3 +95,38 @@ DeepSeek 编程助手（多维度专项审查：安全/漏洞/Bug/性能/质量/
 3. **桥接 TLS**：当前明文 HTTP，生产部署必须走 HTTPS 反向代理；`provided_token` 支持从 payload 读取，建议只保留 Header 通道
 4. **依赖审计**：CI 接入 `pip-audit`；SAST 接入 Bandit（与首轮结论一致）
 5. **快照命名**：`profile_history.py` 快照文件名含画像内 version 字段（rollback 入口已封堵，仅画像被污染时理论可触发）
+
+---
+
+## 审计日期：2026-08-30（第三轮安全审查与修复）
+
+### 审计人
+ZCode（GLM 编码助手），对全部 Python 源码做静态审计 + 动态验证（构造攻击载荷实测），发现 1 Medium + 4 Low，已全部修复并补回归测试。
+
+### 修复清单
+
+| 问题 | 等级 | 修复 |
+|------|------|------|
+| webhook token 可经请求体传输（M1） | Medium | `feishu_automation.py` `provided_token()` 移除 payload 分支，仅接受 Header（`X-LocalPipe-Token` 系 / `Authorization: Bearer`）；请求体会被网关/代理日志原样记录，token 入 body 等于明文落盘 |
+| `load_dotenv` 覆盖平台环境变量（L1） | Low | `pipeline.py` 改 `os.environ.setdefault()`：CI/容器注入的密钥优先于仓库目录 `.env` |
+| 错误路径回显 LLM 原文（L2） | Low | `pipeline.py` `_parse_json_text` 两处 `raw[:300]`/`text[:300]` 移除，只保留响应长度；`_llm_json` 重试日志只打印异常类型。清偿上轮待办 #2 |
+| `/query` 无限频（L3） | Low | `feishu_automation.py` 滑动窗口限频（10s/5 次），置于 token 校验之后（未鉴权请求不消耗配额，防同 IP 打满合法调用方）；顺带将原 challenge 限频的最小间隔语义修正为标准窗口计数 |
+| 注入预警走 stderr 无 ANSI 剥离（L4） | Low | `model.py` `sanitize_user_input` 预警改 `safe_print(file=sys.stderr)`；`safe_print` 支持指定输出流 |
+
+### 回归测试
+
+新增 4 项（`test_pipeline.py`）：body-token 拒收、`/query` 配额与未鉴权豁免、`.env` 不覆盖已有环境变量、JSON 解析错误不含原文回声。`TestFeishuClosedLoop.setUp` 增加限频状态清理（类级状态跨测试串扰会误报 429）。全套 175 项通过。
+
+### 动态验证排除项（实测确认安全）
+
+- 路径穿越：`market_code.py` 白名单拦截 `../`、反斜杠、`.json` 等全部变体
+- Prompt 注入结构层：`sanitize_user_input` 闭合标签逃逸实测无效（迭代清除 + 实体转义，标签计数恒定）
+- `ast.literal_eval`：注入 `__import__` 表达式被 ValueError 拒绝，无 RCE 面
+- `hmac.compare_digest` 防时序侧信道、64KB 请求体上限、动作白名单均实测有效
+
+### 剩余待办（沿袭上轮，未变化）
+
+1. 画像文件名统一（thailand/japan/usa → th/jp/us）
+2. 桥接 TLS：生产部署必须 HTTPS 反向代理（本轮已落实其前置条件：token 仅 Header 传输）
+3. 依赖审计：CI 接入 `pip-audit` / Bandit
+4. 快照命名含画像内 version 字段的理论风险
