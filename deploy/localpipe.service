@@ -1,0 +1,21 @@
+[Unit]
+Description=LocalPipe Feishu Automation Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=localpipe
+Group=localpipe
+WorkingDirectory=/opt/localpipe
+EnvironmentFile=/opt/localpipe/.env
+ExecStart=/opt/localpipe/.venv/bin/python /opt/localpipe/feishu_automation.py --host 127.0.0.1 --port 8080
+Restart=always
+RestartSec=5
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=localpipe
+
+[Install]
+WantedBy=multi-user.target
